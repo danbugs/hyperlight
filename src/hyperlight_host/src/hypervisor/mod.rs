@@ -199,6 +199,7 @@ pub(crate) trait Hypervisor: Debug + Sync + Send {
 
         let val = std::env::var("RUST_LOG").unwrap_or_default();
 
+        // TODO(danbugs): maybe update when I'm done w/ the move?
         let level = if val.contains("hyperlight_guest") {
             val.split(',')
                 .find(|s| s.contains("hyperlight_guest"))

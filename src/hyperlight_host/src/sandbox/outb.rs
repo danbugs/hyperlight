@@ -70,6 +70,7 @@ pub(super) fn outb_log(mgr: &mut SandboxMemoryManager<HostSharedMemory>) -> Resu
             &Record::builder()
                 .args(format_args!("{}", log_data.message))
                 .level(record_level)
+                // TODO(danbugs): maybe update when I'm done w/ the move?
                 .target("hyperlight_guest")
                 .file(source_file)
                 .line(line)
@@ -82,6 +83,7 @@ pub(super) fn outb_log(mgr: &mut SandboxMemoryManager<HostSharedMemory>) -> Resu
             &Record::builder()
                 .args(format_args!("{}", log_data.message))
                 .level(record_level)
+                // TODO(danbugs): maybe update when I'm done w/ the move?
                 .target("hyperlight_guest")
                 .file(Some(&log_data.source_file))
                 .line(Some(log_data.line))
@@ -453,6 +455,7 @@ mod tests {
                         test_value_as_str(metadata_values_map, "level", expected_level);
                         test_value_as_str(event_values_map, "log.file", "test source file");
                         test_value_as_str(event_values_map, "log.module_path", "test source");
+                        // TODO(danbugs): maybe update when I'm done w/ the move?
                         test_value_as_str(event_values_map, "log.target", "hyperlight_guest");
                         count_matching_events += 1;
                     }

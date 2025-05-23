@@ -83,6 +83,7 @@ impl Log for SimpleLogger {
         // the "hyperlight_guest" target will be the same as the number of messages logged by the guest.
         // In other words this function should always return true for the "hyperlight_guest" target.
         unsafe {
+            // TODO(danbugs): maybe update when I'm done w/ the move?
             if metadata.target() == "hyperlight_guest" {
                 NUMBER_OF_ENABLED_CALLS += 1;
             }

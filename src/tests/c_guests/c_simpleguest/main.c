@@ -1,5 +1,6 @@
 // Included from hyperlight_guest_capi/include
 #include "hyperlight_guest.h"
+// TODO(danbugs): update when I'm done w/ the move
 // Included from hyperlight_guest/third_party/libc
 #include "stdint.h"
 #include "string.h"

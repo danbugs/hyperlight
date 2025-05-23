@@ -2,6 +2,7 @@
 extend-ignore-identifiers-re = ["Fo"]
 
 [files]
+# TODO(danbugs): update this when I'm done w/ the move
 extend-exclude = ["**/*.patch", "src/hyperlight_guest/third_party/**/*", "NOTICE.txt"]
 
 [default.extend-words]

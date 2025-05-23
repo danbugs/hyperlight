@@ -478,6 +478,7 @@ fn log_message() {
         assert_eq!(expected, LOGGER.num_log_calls());
 
         // Set the log level via env var
+        // TODO(danbugs): maybe update when I'm done w/ the move?
         std::env::set_var("RUST_LOG", format!("hyperlight_guest={}", level));
         log_test_messages(None);
         assert_eq!(expected, LOGGER.num_log_calls());

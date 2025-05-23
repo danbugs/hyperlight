@@ -90,6 +90,7 @@ impl Log for Logger {
         }
 
         LOGCALLS.with(|log_calls| {
+            // TODO(danbugs): maybe update when I'm done w/ the move?
             if record.target().contains("hyperlight_guest") {
                 println!("Thread {:?} {:?}", current().id(), record);
                 println!("Thread {:?} {:?}", current().id(), record.metadata());
