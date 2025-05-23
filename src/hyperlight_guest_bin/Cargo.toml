@@ -9,6 +9,8 @@ repository.workspace = true
 readme.workspace = true
 
 [dependencies]
+hyperlight-guest = { workspace = true, default-features = false}
+hyperlight-common = { workspace = true, default-features = false}
 
 [lints]
 workspace = true

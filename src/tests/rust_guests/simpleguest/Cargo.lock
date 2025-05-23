@@ -92,6 +92,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyperlight-guest-bin"
+version = "0.4.0"
+dependencies = [
+ "hyperlight-common",
+ "hyperlight-guest",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -214,6 +222,7 @@ version = "0.4.0"
 dependencies = [
  "hyperlight-common",
  "hyperlight-guest",
+ "hyperlight-guest-bin",
  "log",
 ]
 

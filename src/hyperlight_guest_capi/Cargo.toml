@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 hyperlight-guest = { workspace = true, default-features = true }
+hyperlight-guest-bin = { workspace = true, default-features = false }
 hyperlight-common = { workspace = true, default-features = false }
 log = { version = "0.4", default-features = false }
 

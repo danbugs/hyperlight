@@ -35,6 +35,7 @@ version = "0.1.0"
 dependencies = [
  "hyperlight-common",
  "hyperlight-guest",
+ "hyperlight-guest-bin",
 ]
 
 [[package]]
@@ -97,6 +98,14 @@ dependencies = [
  "log",
  "serde_json",
  "spin 0.10.0",
+]
+
+[[package]]
+name = "hyperlight-guest-bin"
+version = "0.4.0"
+dependencies = [
+ "hyperlight-common",
+ "hyperlight-guest",
 ]
 
 [[package]]

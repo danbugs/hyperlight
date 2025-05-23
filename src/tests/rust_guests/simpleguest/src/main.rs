@@ -25,6 +25,10 @@ const MAX_BUFFER_SIZE: usize = 1024;
 
 extern crate alloc;
 
+// TODO(danbugs): this is needed so the panic handler is actually brought in.
+// We can remove it later once more functionality was moved to hyperlight-guest-bin
+extern crate hyperlight_guest_bin;
+
 use alloc::boxed::Box;
 use alloc::string::ToString;
 use alloc::vec::Vec;

@@ -37,6 +37,10 @@ use hyperlight_guest::guest_function_register::register_function;
 use hyperlight_guest::host_function_call::{call_host_function, print_output_with_host_print};
 use hyperlight_guest::logging::log_message;
 
+// TODO(danbugs): this is needed so the panic handler is actually brought in.
+// We can remove it later once more functionality was moved to hyperlight-guest-bin
+extern crate hyperlight_guest_bin;
+
 fn send_message_to_host_method(
     method_name: &str,
     guest_message: &str,
