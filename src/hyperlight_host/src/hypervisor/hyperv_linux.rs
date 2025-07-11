@@ -484,7 +484,7 @@ impl HypervLinuxDriver {
                 present: 1,
                 s: 1, // Code/data segment
                 ..Default::default()
-            }
+            },
             ..Default::default()
         };
 
