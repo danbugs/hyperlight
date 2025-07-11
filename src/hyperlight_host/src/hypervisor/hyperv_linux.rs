@@ -479,7 +479,7 @@ impl HypervLinuxDriver {
             cs: SegmentRegister {
                 base: 0,
                 selector: 0,
-                limit: 0xFFFF,
+                limit: 65535,
                 type_: 11, // Execute/Read
                 present: 1,
                 s: 1, // Code/data segment
@@ -489,6 +489,39 @@ impl HypervLinuxDriver {
         };
 
         vcpu.set_sregs(&sregs)?;
+
+        #[cfg(not(feature = "init-paging"))]
+        {
+            let sregs_check = vcpu.get_sregs()?;
+            println!("=== MSHV Initial State (non-init-paging) ===");
+            println!("CR0: 0x{:x}", sregs_check.cr0);
+            println!("CR3: 0x{:x}", sregs_check.cr3);
+            println!("CR4: 0x{:x}", sregs_check.cr4);
+            println!("EFER: 0x{:x}", sregs_check.efer);
+            println!(
+                "CS: base=0x{:x}, selector=0x{:x}, limit=0x{:x}, type_={}, s={}, dpl={}, present={}, avl={}, l={}, db={}, g={}",
+                sregs_check.cs.base,
+                sregs_check.cs.selector,
+                sregs_check.cs.limit,
+                sregs_check.cs.type_,
+                sregs_check.cs.s,
+                sregs_check.cs.dpl,
+                sregs_check.cs.present,
+                sregs_check.cs.avl,
+                sregs_check.cs.l,
+                sregs_check.cs.db,
+                sregs_check.cs.g
+            );
+            println!(
+                "SS: base=0x{:x}, selector=0x{:x}, limit=0x{:x}",
+                sregs_check.ss.base, sregs_check.ss.selector, sregs_check.ss.limit
+            );
+            println!(
+                "DS: base=0x{:x}, selector=0x{:x}, limit=0x{:x}",
+                sregs_check.ds.base, sregs_check.ds.selector, sregs_check.ds.limit
+            );
+        }
+        
         Ok(())
     }
 }
