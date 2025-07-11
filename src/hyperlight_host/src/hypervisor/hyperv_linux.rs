@@ -476,7 +476,7 @@ impl HypervLinuxDriver {
 
         #[cfg(not(feature = "init-paging"))]
         let sregs = SpecialRegisters {
-            cr0: 0x60000010,  // Match KVM's CR0 value
+            cr0: 0,
             cs: SegmentRegister {
                 base: 0,
                 selector: 0,
