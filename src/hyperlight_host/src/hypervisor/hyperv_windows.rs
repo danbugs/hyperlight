@@ -419,6 +419,23 @@ impl HypervWindowsDriver {
             )])?;
         }
 
+        #[cfg(not(feature = "init-paging"))]
+        {
+            let sregs = proc.get_sregs()?;
+            println!("=== Windows Hyper-V Initial State (non-init-paging) ===");
+            println!("CR0: 0x{:x}", unsafe { sregs.cr0.Reg64 });
+            println!("CR3: 0x{:x}", unsafe { sregs.cr3.Reg64 });
+            println!("CR4: 0x{:x}", unsafe { sregs.cr4.Reg64 });
+            println!("EFER: 0x{:x}", unsafe { sregs.efer.Reg64 });
+            println!(
+                "CS: base=0x{:x}, selector=0x{:x}, limit=0x{:x}, attributes=0x{:x}",
+                unsafe { sregs.cs.Segment.Base },
+                unsafe { sregs.cs.Segment.Selector },
+                unsafe { sregs.cs.Segment.Limit },
+                unsafe { sregs.cs.Segment.Anonymous.Attributes }
+            );
+        }
+
         Ok(())
     }
 

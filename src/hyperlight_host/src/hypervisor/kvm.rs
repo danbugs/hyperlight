@@ -409,6 +409,31 @@ impl KVMDriver {
             }
         }
         vcpu_fd.set_sregs(&sregs)?;
+
+        #[cfg(not(feature = "init-paging"))]
+        {
+            let sregs_after = vcpu_fd.get_sregs()?;
+            println!("=== KVM Initial State (non-init-paging) ===");
+            println!("CR0: 0x{:x}", sregs_after.cr0);
+            println!("CR3: 0x{:x}", sregs_after.cr3);
+            println!("CR4: 0x{:x}", sregs_after.cr4);
+            println!("EFER: 0x{:x}", sregs_after.efer);
+            println!(
+                "CS: base=0x{:x}, selector=0x{:x}, limit=0x{:x}, type=0x{:x}, s={}, dpl={}, p={}, avl={}, l={}, db={}, g={}",
+                sregs_after.cs.base,
+                sregs_after.cs.selector,
+                sregs_after.cs.limit,
+                sregs_after.cs.type_,
+                sregs_after.cs.s,
+                sregs_after.cs.dpl,
+                sregs_after.cs.present,
+                sregs_after.cs.avl,
+                sregs_after.cs.l,
+                sregs_after.cs.db,
+                sregs_after.cs.g
+            );
+        }
+        
         Ok(())
     }
 }
