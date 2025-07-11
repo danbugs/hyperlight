@@ -479,10 +479,15 @@ impl HypervLinuxDriver {
             cs: SegmentRegister {
                 base: 0,
                 selector: 0,
+                limit: 0xFFFF,
+                type_: 11, // Execute/Read
+                present: 1,
+                s: 1, // Code/data segment
                 ..Default::default()
-            },
+            }
             ..Default::default()
         };
+
         vcpu.set_sregs(&sregs)?;
         Ok(())
     }
