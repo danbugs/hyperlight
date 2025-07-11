@@ -479,6 +479,28 @@ impl HypervLinuxDriver {
             cs: SegmentRegister {
                 base: 0,
                 selector: 0,
+                limit: 0xFFFF,
+                type_: 11,
+                present: 1,
+                s: 1,
+                ..Default::default()
+            },
+            ds: SegmentRegister {
+                base: 0,
+                selector: 0,
+                limit: 0xFFFF,
+                type_: 3,
+                present: 1,
+                s: 1,
+                ..Default::default()
+            },
+            tr: SegmentRegister {
+                base: 0,
+                selector: 0,
+                limit: 0xFFFF,
+                type_: 11,
+                present: 1,
+                s: 0,
                 ..Default::default()
             },
             ..Default::default()
