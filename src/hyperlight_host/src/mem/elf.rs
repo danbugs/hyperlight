@@ -206,6 +206,26 @@ impl ElfInfo {
                 .copy_from_slice(&self.payload[payload_offset..payload_offset + payload_len]);
             target[start_va + payload_len..start_va + phdr.p_memsz as usize].fill(0);
         }
+        // Zero-fill NOBITS sections (e.g., .bss) that may be embedded within
+        // a PT_LOAD segment where filesz == memsz. In such binaries the file
+        // bytes at the BSS virtual addresses contain stale data from other
+        // sections (like .rela.dyn) that must be zeroed.
+        // Skip .tbss (SHF_TLS) — thread-local BSS shares its VMA with .data
+        // but is allocated per-thread, not in the main memory image.
+        if let Ok(elf) = Elf::parse(&self.payload) {
+            for sh in &elf.section_headers {
+                if sh.sh_type == goblin::elf::section_header::SHT_NOBITS
+                    && sh.sh_size > 0
+                    && (sh.sh_flags & u64::from(goblin::elf::section_header::SHF_TLS)) == 0
+                {
+                    let sh_start = (sh.sh_addr - base_va) as usize;
+                    let sh_end = sh_start + sh.sh_size as usize;
+                    if sh_end <= target.len() {
+                        target[sh_start..sh_end].fill(0);
+                    }
+                }
+            }
+        }
         let get_addend = |name, r: &Reloc| {
             r.r_addend
                 .ok_or_else(|| new_error!("{} missing addend", name))
