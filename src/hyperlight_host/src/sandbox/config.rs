@@ -91,8 +91,13 @@ impl SandboxConfiguration {
     pub const INTERRUPT_VCPU_SIGRTMIN_OFFSET: u8 = 0;
     /// The default heap size of a hyperlight sandbox
     pub const DEFAULT_HEAP_SIZE: u64 = 131072;
-    /// The default size of the scratch region
+    /// The default size of the scratch region.
+    /// i686 guests need larger scratch for CoW page copies.
+    #[cfg(not(feature = "i686-guest"))]
     pub const DEFAULT_SCRATCH_SIZE: usize = 0x48000;
+    /// The default size of the scratch region for i686 guests (16 MiB).
+    #[cfg(feature = "i686-guest")]
+    pub const DEFAULT_SCRATCH_SIZE: usize = 16 * 1024 * 1024;
 
     #[allow(clippy::too_many_arguments)]
     /// Create a new configuration for a sandbox with the given sizes.

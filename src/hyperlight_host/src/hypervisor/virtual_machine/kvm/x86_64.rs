@@ -36,7 +36,7 @@ use crate::hypervisor::regs::{
     CommonDebugRegs, CommonFpu, CommonRegisters, CommonSpecialRegisters, FP_CONTROL_WORD_DEFAULT,
     MXCSR_DEFAULT,
 };
-#[cfg(all(test, not(feature = "nanvix-unstable")))]
+#[cfg(all(test, not(feature = "i686-guest")))]
 use crate::hypervisor::virtual_machine::XSAVE_BUFFER_SIZE;
 #[cfg(feature = "hw-interrupts")]
 use crate::hypervisor::virtual_machine::x86_64::hw_interrupts::TimerThread;
@@ -240,11 +240,16 @@ impl KvmVm {
                     libc::EAGAIN => continue,
                     _ => return Err(RunVcpuError::Unknown(e.into())),
                 },
-                Ok(other) => {
-                    return Ok(VmExit::Unknown(format!(
-                        "Unknown KVM VCPU exit: {:?}",
-                        other
-                    )));
+                Ok(ref other) => {
+                    let msg = format!("Unknown KVM VCPU exit: {:?}", other);
+                    drop(other);
+                    if let Ok(regs) = self.vcpu_fd.get_regs() {
+                        if let Ok(sregs) = self.vcpu_fd.get_sregs() {
+                            eprintln!("VCPU: rip={:#x} rsp={:#x} cr3={:#x} idtr.base={:#x}",
+                                regs.rip, regs.rsp, sregs.cr3, sregs.idt.base);
+                        }
+                    }
+                    return Ok(VmExit::Unknown(msg));
                 }
             }
         }
@@ -446,7 +451,7 @@ impl VirtualMachine for KvmVm {
     }
 
     #[cfg(test)]
-    #[cfg(not(feature = "nanvix-unstable"))]
+    #[cfg(not(feature = "i686-guest"))]
     fn set_xsave(&self, xsave: &[u32]) -> std::result::Result<(), RegisterError> {
         if std::mem::size_of_val(xsave) != XSAVE_BUFFER_SIZE {
             return Err(RegisterError::XsaveSizeMismatch {

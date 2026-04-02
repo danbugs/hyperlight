@@ -100,11 +100,11 @@ impl HyperlightVm {
             None => return Err(CreateHyperlightVmError::NoHypervisorFound),
         };
 
-        #[cfg(not(feature = "nanvix-unstable"))]
+        #[cfg(not(feature = "i686-guest"))]
         vm.set_sregs(&CommonSpecialRegisters::standard_64bit_defaults(_pml4_addr))
             .map_err(VmError::Register)?;
-        #[cfg(feature = "nanvix-unstable")]
-        vm.set_sregs(&CommonSpecialRegisters::standard_real_mode_defaults())
+        #[cfg(feature = "i686-guest")]
+        vm.set_sregs(&CommonSpecialRegisters::standard_32bit_paging_defaults(_pml4_addr))
             .map_err(VmError::Register)?;
 
         #[cfg(any(kvm, mshv3))]
@@ -248,21 +248,11 @@ impl HyperlightVm {
         Ok(())
     }
 
-    /// Get the current base page table physical address.
-    ///
-    /// By default, reads CR3 from the vCPU special registers.
-    /// With `nanvix-unstable`, returns 0 (identity-mapped, no page tables).
+    /// Get the current base page table physical address from CR3.
     pub(crate) fn get_root_pt(&self) -> Result<u64, AccessPageTableError> {
-        #[cfg(not(feature = "nanvix-unstable"))]
-        {
-            let sregs = self.vm.sregs()?;
-            // Mask off the flags bits
-            Ok(sregs.cr3 & !0xfff_u64)
-        }
-        #[cfg(feature = "nanvix-unstable")]
-        {
-            Ok(0)
-        }
+        let sregs = self.vm.sregs()?;
+        // Mask off the flags bits
+        Ok(sregs.cr3 & !0xfff_u64)
     }
 
     /// Get the special registers that need to be stored in a snapshot.
@@ -352,7 +342,7 @@ impl HyperlightVm {
         self.vm.set_debug_regs(&CommonDebugRegs::default())?;
         self.vm.reset_xsave()?;
 
-        #[cfg(not(feature = "nanvix-unstable"))]
+        #[cfg(not(feature = "i686-guest"))]
         {
             // Restore the full special registers from snapshot, but update CR3
             // to point to the new (relocated) page tables
@@ -361,13 +351,13 @@ impl HyperlightVm {
             self.pending_tlb_flush = true;
             self.vm.set_sregs(&sregs)?;
         }
-        #[cfg(feature = "nanvix-unstable")]
+        #[cfg(feature = "i686-guest")]
         {
-            let _ = (cr3, sregs); // suppress unused warnings
-            // TODO: This is probably not correct.
-            // Let's deal with it when we clean up the nanvix-unstable feature
-            self.vm
-                .set_sregs(&CommonSpecialRegisters::standard_real_mode_defaults())?;
+            // Restore 32-bit protected mode from snapshot sregs, update CR3.
+            let mut sregs = *sregs;
+            sregs.cr3 = cr3;
+            self.pending_tlb_flush = true;
+            self.vm.set_sregs(&sregs)?;
         }
 
         Ok(())
@@ -874,7 +864,7 @@ pub(super) mod debug {
 }
 
 #[cfg(test)]
-#[cfg(not(feature = "nanvix-unstable"))]
+#[cfg(not(feature = "i686-guest"))]
 #[allow(clippy::needless_range_loop)]
 mod tests {
     use std::sync::{Arc, Mutex};

@@ -247,27 +247,93 @@ fn filtered_mappings<'a>(
     layout: SandboxMemoryLayout,
     root_pt: u64,
 ) -> Vec<(Mapping, &'a [u8])> {
-    let op = SharedMemoryPageTableBuffer::new(snap, scratch, layout, root_pt);
-    unsafe {
-        hyperlight_common::vmem::virt_to_phys(&op, 0, hyperlight_common::layout::MAX_GVA as u64)
-    }
-    .filter_map(move |mapping| {
-        // the scratch map doesn't count
-        if mapping.virt_base >= scratch_base_gva(layout.get_scratch_size()) {
-            return None;
+    #[cfg(not(feature = "i686-guest"))]
+    let mappings_iter: Vec<Mapping> = {
+        let op = SharedMemoryPageTableBuffer::new(snap, scratch, layout, root_pt);
+        unsafe {
+            hyperlight_common::vmem::virt_to_phys(
+                &op,
+                0,
+                hyperlight_common::layout::MAX_GVA as u64,
+            )
         }
-        // neither does the mapping of the snapshot's own page tables
-        #[cfg(not(feature = "nanvix-unstable"))]
-        if mapping.virt_base >= hyperlight_common::layout::SNAPSHOT_PT_GVA_MIN as u64
-            && mapping.virt_base <= hyperlight_common::layout::SNAPSHOT_PT_GVA_MAX as u64
-        {
-            return None;
+        .collect()
+    };
+
+    #[cfg(feature = "i686-guest")]
+    let mappings_iter: Vec<Mapping> = {
+        // Walk i686 2-level page tables (4-byte PTEs) directly.
+        // The host is x86_64, so the generic virt_to_phys uses 4-level 8-byte
+        // PTEs — wrong for i686 guests. We inline the 2-level walk here.
+        const PTE_PRESENT: u32 = 1;
+        const PTE_RW: u32 = 1 << 1;
+        const PTE_COW: u32 = 1 << 9;
+        const PTE_ADDR_MASK: u32 = 0xFFFFF000;
+
+        let read_u32_at = |gpa: u64| -> u32 {
+            access_gpa(snap, scratch, layout, gpa)
+                .and_then(|(mem, off)| mem.get(off..off + 4))
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .unwrap_or(0)
+        };
+
+        let mut mappings = Vec::new();
+        for pdi in 0..1024u32 {
+            let pde = read_u32_at(root_pt + (pdi as u64) * 4);
+            if (pde & PTE_PRESENT) == 0 {
+                continue;
+            }
+            let pt_phys = (pde & PTE_ADDR_MASK) as u64;
+            for pti in 0..1024u32 {
+                let pte = read_u32_at(pt_phys + (pti as u64) * 4);
+                if (pte & PTE_PRESENT) == 0 {
+                    continue;
+                }
+                let phys_base = (pte & PTE_ADDR_MASK) as u64;
+                let virt_base = ((pdi << 22) | (pti << 12)) as u64;
+                let kind = if (pte & PTE_COW) != 0 {
+                    MappingKind::Cow(CowMapping {
+                        readable: true,
+                        executable: true,
+                    })
+                } else {
+                    MappingKind::Basic(BasicMapping {
+                        readable: true,
+                        writable: (pte & PTE_RW) != 0,
+                        executable: true,
+                    })
+                };
+                mappings.push(Mapping {
+                    phys_base,
+                    virt_base,
+                    len: PAGE_SIZE as u64,
+                    kind,
+                });
+            }
         }
-        // todo: is it useful to warn if we can't resolve this?
-        let contents = unsafe { guest_page(snap, scratch, regions, layout, mapping.phys_base) }?;
-        Some((mapping, contents))
-    })
-    .collect()
+        mappings
+    };
+
+    mappings_iter
+        .into_iter()
+        .filter_map(move |mapping| {
+            // the scratch map doesn't count
+            if mapping.virt_base >= scratch_base_gva(layout.get_scratch_size()) {
+                return None;
+            }
+            // neither does the mapping of the snapshot's own page tables
+            #[cfg(not(feature = "i686-guest"))]
+            if mapping.virt_base >= hyperlight_common::layout::SNAPSHOT_PT_GVA_MIN as u64
+                && mapping.virt_base <= hyperlight_common::layout::SNAPSHOT_PT_GVA_MAX as u64
+            {
+                return None;
+            }
+            // todo: is it useful to warn if we can't resolve this?
+            let contents =
+                unsafe { guest_page(snap, scratch, regions, layout, mapping.phys_base) }?;
+            Some((mapping, contents))
+        })
+        .collect()
 }
 
 /// Find the contents of the page which starts at gpa in guest physical
@@ -342,7 +408,6 @@ impl Snapshot {
         let guest_blob_size = blob.as_ref().map(|b| b.data.len()).unwrap_or(0);
         let guest_blob_mem_flags = blob.as_ref().map(|b| b.permissions);
 
-        #[cfg_attr(feature = "nanvix-unstable", allow(unused_mut))]
         let mut layout = crate::mem::layout::SandboxMemoryLayout::new(
             cfg,
             exe_info.loaded_size(),
@@ -351,7 +416,8 @@ impl Snapshot {
         )?;
 
         let load_addr = layout.get_guest_code_address() as u64;
-        let entrypoint_offset: u64 = exe_info.entrypoint().into();
+        let base_va = exe_info.base_va();
+        let entrypoint_va: u64 = exe_info.entrypoint().into();
 
         let mut memory = vec![0; layout.get_memory_size()?];
 
@@ -365,14 +431,13 @@ impl Snapshot {
         blob.map(|x| layout.write_init_data(&mut memory, x.data))
             .transpose()?;
 
-        #[cfg(not(feature = "nanvix-unstable"))]
+        #[cfg(not(feature = "i686-guest"))]
         {
-            // Set up page table entries for the snapshot
+            // Set up 4-level (amd64) page table entries for the snapshot
             let pt_buf = GuestPageTableBuffer::new(layout.get_pt_base_gpa() as usize);
 
             use crate::mem::memory_region::{GuestMemoryRegion, MemoryRegionFlags};
 
-            // 1. Map the (ideally readonly) pages of snapshot data
             for rgn in layout.get_memory_regions_::<GuestMemoryRegion>(())?.iter() {
                 let readable = rgn.flags.contains(MemoryRegionFlags::READ);
                 let executable = rgn.flags.contains(MemoryRegionFlags::EXECUTE);
@@ -398,10 +463,142 @@ impl Snapshot {
                 unsafe { vmem::map(&pt_buf, mapping) };
             }
 
-            // 2. Map the special mappings
             map_specials(&pt_buf, layout.get_scratch_size());
 
             let pt_bytes = pt_buf.into_bytes();
+            layout.set_pt_size(pt_bytes.len())?;
+            memory.extend(&pt_bytes);
+        };
+        #[cfg(feature = "i686-guest")]
+        {
+            // Build 2-level (i686) page tables directly with 4-byte PTEs.
+            use crate::mem::memory_region::{GuestMemoryRegion, MemoryRegionFlags};
+
+            let page_size: usize = 4096;
+            // PDE entries MUST reference scratch GPAs (not shared memory) because
+            // the CoW handler accesses PT pages via virtual addresses. The guest PT
+            // maps scratch (writable), so VA accesses to PT pages in scratch work.
+            // Using shared memory GPAs would require mapping the PT area in the
+            // guest PT (self-referencing), which we don't do.
+            let pd_base_gpa = layout.get_pt_base_gpa() as usize;
+            let mut pt_bytes: Vec<u8> = vec![0u8; page_size]; // Start with PD (one 4KB page)
+
+            // i686 PTE flags
+            const PTE_PRESENT: u32 = 1;
+            const PTE_RW: u32 = 1 << 1;
+            const PTE_ACCESSED: u32 = 1 << 5;
+            const PTE_COW: u32 = 1 << 9; // AVL bit 9: CoW marker
+
+            let mut map_region = |va_start: u64, pa_start: u64, len: u64, writable: bool| {
+                let mut va = va_start;
+                let mut pa = pa_start;
+                let end = va_start + len;
+                let leaf_flags: u32 = if writable {
+                    // Writable pages: BASIC RW. The host MAP_PRIVATE mmap
+                    // provides OS-level CoW for the snapshot backing. With
+                    // unshared_snapshot_mem disabled, restore is O(1).
+                    //
+                    // TODO: Switch to guest-assisted CoW (PTE_COW instead of
+                    // PTE_RW) once the stack overflow during boot is resolved.
+                    // The issue is that the CoW handler resolves kstack guard
+                    // pages, letting the stack silently overflow.
+                    PTE_PRESENT | PTE_ACCESSED | PTE_RW
+                } else {
+                    PTE_PRESENT | PTE_ACCESSED // Genuinely read-only
+                };
+
+                while va < end {
+                    let pdi = ((va as u32 >> 22) & 0x3FF) as usize;
+                    let pti = ((va as u32 >> 12) & 0x3FF) as usize;
+
+                    // Check if PDE exists
+                    let pde_off = pdi * 4;
+                    let pde = u32::from_le_bytes([
+                        pt_bytes[pde_off],
+                        pt_bytes[pde_off + 1],
+                        pt_bytes[pde_off + 2],
+                        pt_bytes[pde_off + 3],
+                    ]);
+
+                    let pt_offset_in_buf = if (pde & PTE_PRESENT) == 0 {
+                        // Allocate a new PT page
+                        let pt_offset = pt_bytes.len();
+                        pt_bytes.resize(pt_offset + page_size, 0);
+                        let pt_gpa = (pd_base_gpa + pt_offset) as u32;
+                        let new_pde = pt_gpa | PTE_PRESENT | PTE_RW | PTE_ACCESSED;
+                        pt_bytes[pde_off..pde_off + 4]
+                            .copy_from_slice(&new_pde.to_le_bytes());
+                        pt_offset
+                    } else {
+                        let pt_gpa = pde & 0xFFFFF000;
+                        (pt_gpa as usize) - pd_base_gpa
+                    };
+
+                    // Write PTE
+                    let pte_off = pt_offset_in_buf + pti * 4;
+                    let pte = (pa as u32) | leaf_flags;
+                    pt_bytes[pte_off..pte_off + 4]
+                        .copy_from_slice(&pte.to_le_bytes());
+
+                    va += page_size as u64;
+                    pa += page_size as u64;
+                }
+            };
+
+            // 1. Map snapshot memory regions
+            for rgn in layout.get_memory_regions_::<GuestMemoryRegion>(())?.iter() {
+                let writable = rgn.flags.contains(MemoryRegionFlags::WRITE);
+                map_region(
+                    rgn.guest_region.start as u64,
+                    rgn.guest_region.start as u64,
+                    rgn.guest_region.len() as u64,
+                    writable,
+                );
+            }
+
+            // 2. Map scratch region (always writable, not CoW)
+            {
+                let scratch_size = layout.get_scratch_size();
+                let scratch_gpa = hyperlight_common::layout::scratch_base_gpa(scratch_size);
+                let scratch_gva = hyperlight_common::layout::scratch_base_gva(scratch_size);
+                let mut va = scratch_gva;
+                let mut pa = scratch_gpa;
+                let end = scratch_gva + scratch_size as u64;
+                while va < end {
+                    let pdi = ((va as u32 >> 22) & 0x3FF) as usize;
+                    let pti = ((va as u32 >> 12) & 0x3FF) as usize;
+
+                    let pde_off = pdi * 4;
+                    let pde = u32::from_le_bytes([
+                        pt_bytes[pde_off],
+                        pt_bytes[pde_off + 1],
+                        pt_bytes[pde_off + 2],
+                        pt_bytes[pde_off + 3],
+                    ]);
+
+                    let pt_offset_in_buf = if (pde & PTE_PRESENT) == 0 {
+                        let pt_offset = pt_bytes.len();
+                        pt_bytes.resize(pt_offset + page_size, 0);
+                        let pt_gpa = (pd_base_gpa + pt_offset) as u32;
+                        let new_pde = pt_gpa | PTE_PRESENT | PTE_RW | PTE_ACCESSED;
+                        pt_bytes[pde_off..pde_off + 4]
+                            .copy_from_slice(&new_pde.to_le_bytes());
+                        pt_offset
+                    } else {
+                        let pt_gpa = pde & 0xFFFFF000;
+                        (pt_gpa as usize) - pd_base_gpa
+                    };
+
+                    let pte_off = pt_offset_in_buf + pti * 4;
+                    let pte = (pa as u32) | PTE_PRESENT | PTE_RW | PTE_ACCESSED;
+                    pt_bytes[pte_off..pte_off + 4]
+                        .copy_from_slice(&pte.to_le_bytes());
+
+                    va += page_size as u64;
+                    pa += page_size as u64;
+                }
+            }
+
             layout.set_pt_size(pt_bytes.len())?;
             memory.extend(&pt_bytes);
         };
@@ -413,6 +610,8 @@ impl Snapshot {
         let extra_regions = Vec::new();
         let hash = hash(&memory, &extra_regions)?;
 
+        let sregs = None;
+
         Ok(Self {
             sandbox_id: SANDBOX_CONFIGURATION_COUNTER.fetch_add(1, Ordering::Relaxed),
             memory: ReadonlySharedMemory::from_bytes(&memory)?,
@@ -421,8 +620,8 @@ impl Snapshot {
             load_info,
             hash,
             stack_top_gva: exn_stack_top_gva,
-            sregs: None,
-            entrypoint: NextAction::Initialise(load_addr + entrypoint_offset),
+            sregs,
+            entrypoint: NextAction::Initialise(load_addr + entrypoint_va - base_va),
         })
     }
 
@@ -455,42 +654,159 @@ impl Snapshot {
                 let live_pages =
                     filtered_mappings(snap_c, scratch_c, &regions, layout, root_pt_gpa);
 
-                // Pass 2: copy them, and map them
-                // TODO: Look for opportunities to hugepage map
-                let pt_buf = GuestPageTableBuffer::new(layout.get_pt_base_gpa() as usize);
+                // Pass 2: copy live pages and build new page tables
                 let mut snapshot_memory: Vec<u8> = Vec::new();
-                for (mapping, contents) in live_pages {
-                    let kind = match mapping.kind {
-                        MappingKind::Cow(cm) => MappingKind::Cow(cm),
-                        MappingKind::Basic(bm) if bm.writable => MappingKind::Cow(CowMapping {
-                            readable: bm.readable,
-                            executable: bm.executable,
-                        }),
-                        MappingKind::Basic(bm) => MappingKind::Basic(BasicMapping {
-                            readable: bm.readable,
-                            writable: false,
-                            executable: bm.executable,
-                        }),
-                        MappingKind::Unmapped => continue,
-                    };
-                    let new_gpa = phys_seen.entry(mapping.phys_base).or_insert_with(|| {
-                        let new_offset = snapshot_memory.len();
-                        snapshot_memory.extend(contents);
-                        new_offset + SandboxMemoryLayout::BASE_ADDRESS
-                    });
-                    let mapping = Mapping {
-                        phys_base: *new_gpa as u64,
-                        virt_base: mapping.virt_base,
-                        len: PAGE_SIZE as u64,
-                        kind,
-                    };
-                    unsafe { vmem::map(&pt_buf, mapping) };
+
+                #[cfg(not(feature = "i686-guest"))]
+                {
+                    let pt_buf = GuestPageTableBuffer::new(layout.get_pt_base_gpa() as usize);
+                    for (mapping, contents) in live_pages {
+                        let kind = match mapping.kind {
+                            MappingKind::Cow(cm) => MappingKind::Cow(cm),
+                            MappingKind::Basic(bm) if bm.writable => {
+                                MappingKind::Cow(CowMapping {
+                                    readable: bm.readable,
+                                    executable: bm.executable,
+                                })
+                            }
+                            MappingKind::Basic(bm) => MappingKind::Basic(BasicMapping {
+                                readable: bm.readable,
+                                writable: false,
+                                executable: bm.executable,
+                            }),
+                            MappingKind::Unmapped => continue,
+                        };
+                        let new_gpa =
+                            phys_seen.entry(mapping.phys_base).or_insert_with(|| {
+                                let new_offset = snapshot_memory.len();
+                                snapshot_memory.extend(contents);
+                                new_offset + SandboxMemoryLayout::BASE_ADDRESS
+                            });
+                        let mapping = Mapping {
+                            phys_base: *new_gpa as u64,
+                            virt_base: mapping.virt_base,
+                            len: PAGE_SIZE as u64,
+                            kind,
+                        };
+                        unsafe { vmem::map(&pt_buf, mapping) };
+                    }
+                    // Phase 3: Map the special mappings
+                    map_specials(&pt_buf, layout.get_scratch_size());
+                    let pt_bytes = pt_buf.into_bytes();
+                    layout.set_pt_size(pt_bytes.len())?;
+                    snapshot_memory.extend(&pt_bytes);
                 }
-                // Phase 3: Map the special mappings
-                map_specials(&pt_buf, layout.get_scratch_size());
-                let pt_bytes = pt_buf.into_bytes();
-                layout.set_pt_size(pt_bytes.len())?;
-                snapshot_memory.extend(&pt_bytes);
+
+                #[cfg(feature = "i686-guest")]
+                {
+                    // Compact snapshot: walk live pages, copy them, rebuild i686
+                    // page tables at new compacted GPAs. The kernel uses
+                    // Hyperlight's scratch-resident PTs directly (Option A), so
+                    // the rebuilt PTs will be copied into scratch on restore via
+                    // update_scratch_bookkeeping(). CoW bits are set on writable
+                    // pages so the guest #PF handler resolves them lazily.
+                    const I686_PTE_PRESENT: u32 = 1;
+                    const I686_PTE_RW: u32 = 1 << 1;
+                    const I686_PTE_ACCESSED: u32 = 1 << 5;
+                    const I686_PTE_COW: u32 = 1 << 9;
+
+                    let pd_base_gpa = layout.get_pt_base_gpa() as usize;
+                    let page_size: usize = 4096;
+                    let mut pt_bytes: Vec<u8> = vec![0u8; page_size]; // PD
+
+                    let mut i686_map_page =
+                        |va: u64, pa: u64, cow: bool, pt_bytes: &mut Vec<u8>| {
+                            let pdi = ((va as u32 >> 22) & 0x3FF) as usize;
+                            let pti = ((va as u32 >> 12) & 0x3FF) as usize;
+                            let pde_off = pdi * 4;
+                            let pde = u32::from_le_bytes([
+                                pt_bytes[pde_off],
+                                pt_bytes[pde_off + 1],
+                                pt_bytes[pde_off + 2],
+                                pt_bytes[pde_off + 3],
+                            ]);
+                            // Set User bit for user-space VAs (PD index >= 256 = VAs >= 0x40000000).
+                            let user_bit: u32 = if pdi >= 256 { 4 } else { 0 };
+                            let pt_offset_in_buf = if (pde & I686_PTE_PRESENT) == 0 {
+                                let pt_offset = pt_bytes.len();
+                                pt_bytes.resize(pt_offset + page_size, 0);
+                                let pt_gpa = (pd_base_gpa + pt_offset) as u32;
+                                let new_pde =
+                                    pt_gpa | I686_PTE_PRESENT | I686_PTE_RW | I686_PTE_ACCESSED | user_bit;
+                                pt_bytes[pde_off..pde_off + 4]
+                                    .copy_from_slice(&new_pde.to_le_bytes());
+                                pt_offset
+                            } else {
+                                let pt_gpa = pde & 0xFFFFF000;
+                                (pt_gpa as usize) - pd_base_gpa
+                            };
+                            let leaf_flags: u32 = {
+                                let base = I686_PTE_PRESENT | I686_PTE_ACCESSED | user_bit;
+                                if cow { base | I686_PTE_COW } else { base }
+                            };
+                            let pte_off = pt_offset_in_buf + pti * 4;
+                            let pte = (pa as u32) | leaf_flags;
+                            pt_bytes[pte_off..pte_off + 4]
+                                .copy_from_slice(&pte.to_le_bytes());
+                        };
+
+                    for (mapping, contents) in live_pages {
+                        let cow = match mapping.kind {
+                            MappingKind::Cow(_) => true,
+                            MappingKind::Basic(bm) if bm.writable => true,
+                            MappingKind::Basic(_) => false,
+                            MappingKind::Unmapped => continue,
+                        };
+                        let new_gpa =
+                            phys_seen.entry(mapping.phys_base).or_insert_with(|| {
+                                let new_offset = snapshot_memory.len();
+                                snapshot_memory.extend(contents);
+                                new_offset + SandboxMemoryLayout::BASE_ADDRESS
+                            });
+                        i686_map_page(
+                            mapping.virt_base,
+                            *new_gpa as u64,
+                            cow,
+                            &mut pt_bytes,
+                        );
+                    }
+
+                    // Map scratch region (always writable, not CoW).
+                    {
+                        let scratch_size = layout.get_scratch_size();
+                        let scratch_gpa =
+                            hyperlight_common::layout::scratch_base_gpa(scratch_size);
+                        let scratch_gva =
+                            hyperlight_common::layout::scratch_base_gva(scratch_size);
+                        let mut va = scratch_gva;
+                        let mut pa = scratch_gpa;
+                        let end = scratch_gva + scratch_size as u64;
+                        while va < end {
+                            i686_map_page(va, pa, false, &mut pt_bytes);
+                            // Make scratch pages writable (not CoW).
+                            let pdi = ((va as u32 >> 22) & 0x3FF) as usize;
+                            let pti = ((va as u32 >> 12) & 0x3FF) as usize;
+                            let pde = u32::from_le_bytes([
+                                pt_bytes[pdi * 4],
+                                pt_bytes[pdi * 4 + 1],
+                                pt_bytes[pdi * 4 + 2],
+                                pt_bytes[pdi * 4 + 3],
+                            ]);
+                            let pt_gpa = pde & 0xFFFFF000;
+                            let pt_offset = (pt_gpa as usize) - pd_base_gpa;
+                            let pte_off = pt_offset + pti * 4;
+                            let pte = (pa as u32) | I686_PTE_PRESENT | I686_PTE_RW | I686_PTE_ACCESSED;
+                            pt_bytes[pte_off..pte_off + 4]
+                                .copy_from_slice(&pte.to_le_bytes());
+                            va += page_size as u64;
+                            pa += page_size as u64;
+                        }
+                    }
+
+                    layout.set_pt_size(pt_bytes.len())?;
+                    snapshot_memory.extend(&pt_bytes);
+                }
+
                 Ok::<Vec<u8>, crate::HyperlightError>(snapshot_memory)
             })
         })???;
@@ -541,6 +857,9 @@ impl Snapshot {
     }
 
     pub(crate) fn root_pt_gpa(&self) -> u64 {
+        // Page tables are rebuilt in scratch at the layout's PT base during
+        // snapshot compaction. On restore, update_scratch_bookkeeping copies
+        // them back to scratch. CR3 should point to this address.
         self.layout.get_pt_base_gpa()
     }
 

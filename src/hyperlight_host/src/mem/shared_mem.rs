@@ -668,7 +668,7 @@ impl ExclusiveSharedMemory {
     /// Create a [`HostSharedMemory`] view of this region without
     /// consuming `self`. Used in tests where the full `build()` /
     /// `evolve()` pipeline is not available.
-    #[cfg(all(test, feature = "nanvix-unstable"))]
+    #[cfg(all(test, feature = "guest-counter"))]
     pub(crate) fn as_host_shared_memory(&self) -> HostSharedMemory {
         let lock = Arc::new(RwLock::new(()));
         HostSharedMemory {
@@ -2058,12 +2058,25 @@ impl ReadonlySharedMemory {
         if region_type != MemoryRegionType::Snapshot {
             panic!("ReadonlySharedMemory::mapping_at should only be used for Snapshot regions");
         }
-        mapping_at(
-            self,
-            guest_base,
-            region_type,
-            MemoryRegionFlags::READ | MemoryRegionFlags::EXECUTE,
-        )
+        // For i686 with guest-assisted CoW, the KVM memory slot must be
+        // writable so that writes pass through the EPT to the guest page
+        // tables where CoW is enforced. On Intel with EPT, the guest PT is
+        // checked FIRST — if it says read-only (CoW), #PF fires before EPT.
+        // But KVM_MEM_READONLY causes all writes to trigger MmioWrite exits
+        // regardless. So we need writable EPT for CoW to work on KVM.
+        //
+        // The host-level mmap is MAP_PRIVATE which provides OS-level CoW for
+        // the host pages. Combined with guest-assisted CoW (CoW bit in PTEs),
+        // this gives us the correct behavior: guest CoW handler fires on
+        // first write, copies to scratch, updates PTE.
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "i686-guest")] {
+                let flags = MemoryRegionFlags::READ | MemoryRegionFlags::WRITE | MemoryRegionFlags::EXECUTE;
+            } else {
+                let flags = MemoryRegionFlags::READ | MemoryRegionFlags::EXECUTE;
+            }
+        }
+        mapping_at(self, guest_base, region_type, flags)
     }
 }
 
