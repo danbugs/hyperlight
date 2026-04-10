@@ -91,7 +91,7 @@ impl SandboxConfiguration {
     pub const INTERRUPT_VCPU_SIGRTMIN_OFFSET: u8 = 0;
     /// The default heap size of a hyperlight sandbox
     pub const DEFAULT_HEAP_SIZE: u64 = 131072;
-    /// The default size of the scratch region
+    /// The default size of the scratch region.
     pub const DEFAULT_SCRATCH_SIZE: usize = 0x48000;
 
     #[allow(clippy::too_many_arguments)]

@@ -47,6 +47,8 @@ pub use callable::Callable;
 pub use config::SandboxConfiguration;
 /// Re-export for the `MultiUseSandbox` type
 pub use initialized_multi_use::MultiUseSandbox;
+/// Re-export for the `PtRootFinder` callback type
+pub use initialized_multi_use::PtRootFinder;
 /// Re-export for `GuestBinary` type
 pub use uninitialized::GuestBinary;
 /// Re-export for `UninitializedSandbox` type

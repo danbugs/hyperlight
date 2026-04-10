@@ -16,11 +16,11 @@ limitations under the License.
 
 #[cfg_attr(target_arch = "x86", path = "arch/i686/layout.rs")]
 #[cfg_attr(
-    all(target_arch = "x86_64", not(feature = "nanvix-unstable")),
+    all(target_arch = "x86_64", not(feature = "i686-guest")),
     path = "arch/amd64/layout.rs"
 )]
 #[cfg_attr(
-    all(target_arch = "x86_64", feature = "nanvix-unstable"),
+    all(target_arch = "x86_64", feature = "i686-guest"),
     path = "arch/i686/layout.rs"
 )]
 #[cfg_attr(target_arch = "aarch64", path = "arch/aarch64/layout.rs")]
@@ -28,7 +28,7 @@ mod arch;
 
 pub use arch::{MAX_GPA, MAX_GVA};
 #[cfg(any(
-    all(target_arch = "x86_64", not(feature = "nanvix-unstable")),
+    all(target_arch = "x86_64", not(feature = "i686-guest")),
     target_arch = "aarch64"
 ))]
 pub use arch::{SNAPSHOT_PT_GVA_MAX, SNAPSHOT_PT_GVA_MIN};
@@ -39,13 +39,22 @@ pub const SCRATCH_TOP_ALLOCATOR_OFFSET: u64 = 0x10;
 pub const SCRATCH_TOP_SNAPSHOT_PT_GPA_BASE_OFFSET: u64 = 0x18;
 pub const SCRATCH_TOP_EXN_STACK_OFFSET: u64 = 0x20;
 
+/// Offset from the top of scratch for the number of active page directory roots.
+/// The guest writes this before signaling boot-complete so the host can walk
+/// all active PDs during snapshot creation (not just CR3).
+pub const SCRATCH_TOP_PD_ROOTS_COUNT_OFFSET: u64 = 0x28;
+/// Offset from the top of scratch for the PD roots array (u32 GPAs on i686).
+pub const SCRATCH_TOP_PD_ROOTS_ARRAY_OFFSET: u64 = 0x30;
+/// Maximum number of PD roots the guest can expose to the host.
+pub const MAX_PD_ROOTS: usize = 32;
+
 /// Offset from the top of scratch memory for a shared host-guest u64 counter.
 ///
 /// This is placed at 0x1008 (rather than the next sequential 0x28) so that the
 /// counter falls in scratch page 0xffffe000 instead of the very last page
 /// 0xfffff000, which on i686 guests would require frame 0xfffff — exceeding the
 /// maximum representable frame number.
-#[cfg(feature = "nanvix-unstable")]
+#[cfg(feature = "guest-counter")]
 pub const SCRATCH_TOP_GUEST_COUNTER_OFFSET: u64 = 0x1008;
 
 pub fn scratch_base_gpa(size: usize) -> u64 {

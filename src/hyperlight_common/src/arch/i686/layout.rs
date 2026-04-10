@@ -20,6 +20,6 @@ limitations under the License.
 pub const MAX_GVA: usize = 0xffff_ffff;
 pub const MAX_GPA: usize = 0xffff_ffff;
 
-pub fn min_scratch_size(_input_data_size: usize, _output_data_size: usize) -> usize {
-    crate::vmem::PAGE_SIZE
+pub fn min_scratch_size(input_data_size: usize, output_data_size: usize) -> usize {
+    (input_data_size + output_data_size).next_multiple_of(crate::vmem::PAGE_SIZE) + 2 * 1024 * 1024
 }

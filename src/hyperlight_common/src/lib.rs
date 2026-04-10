@@ -48,5 +48,11 @@ pub mod func;
 // cbindgen:ignore
 pub mod vmem;
 
+/// i686 page table constants and walk functions, available to the x86_64 host
+/// when building with the `i686-guest` feature. This allows the host to walk
+/// i686 guest page tables without duplicating arch-specific code.
+#[cfg(feature = "i686-guest")]
+pub mod i686_guest_vmem;
+
 /// ELF note types for embedding hyperlight version metadata in guest binaries.
 pub mod version_note;

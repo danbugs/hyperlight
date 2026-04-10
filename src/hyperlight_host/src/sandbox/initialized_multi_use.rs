@@ -94,7 +94,16 @@ pub struct MultiUseSandbox {
     /// If the current state of the sandbox has been captured in a snapshot,
     /// that snapshot is stored here.
     snapshot: Option<Arc<Snapshot>>,
+    /// Optional callback for discovering page table roots in guest memory.
+    /// Set by embedders (e.g. hyperlight-nanvix) that manage guests with
+    /// multiple page directories. If None, only the hardware CR3 is used.
+    pt_root_finder: Option<PtRootFinder>,
 }
+
+/// Callback type for discovering page table roots in guest memory.
+/// Called during snapshot creation with (shared_mem, scratch_mem, cr3)
+/// and returns the list of PD root GPAs to walk.
+pub type PtRootFinder = Box<dyn Fn(&[u8], &[u8], u64) -> Vec<u64>>;
 
 impl MultiUseSandbox {
     /// Move an `UninitializedSandbox` into a new `MultiUseSandbox` instance.
@@ -118,7 +127,15 @@ impl MultiUseSandbox {
             #[cfg(gdb)]
             dbg_mem_access_fn,
             snapshot: None,
+            pt_root_finder: None,
         }
+    }
+
+    /// Sets a callback for discovering page table roots in guest memory.
+    /// The callback receives (shared_mem, scratch_mem, layout, cr3) and
+    /// returns the list of PD root GPAs. Called during snapshot creation.
+    pub fn set_pt_root_finder(&mut self, finder: PtRootFinder) {
+        self.pt_root_finder = Some(finder);
     }
 
     /// Creates a snapshot of the sandbox's current memory state.
@@ -164,6 +181,20 @@ impl MultiUseSandbox {
             .vm
             .get_root_pt()
             .map_err(|e| HyperlightError::HyperlightVmError(e.into()))?;
+
+        // Discover page table roots. If the embedder registered a callback
+        // (e.g. to walk guest process structures), use it. Otherwise fall
+        // back to reading the scratch bookkeeping array, then just CR3.
+        let root_pt_gpas = if let Some(ref finder) = self.pt_root_finder {
+            self.mem_mgr.shared_mem.with_contents(|snap| {
+                self.mem_mgr.scratch_mem.with_contents(|scratch| {
+                    finder(snap, scratch, root_pt_gpa)
+                })
+            })??
+        } else {
+            self.read_pd_roots_from_scratch(root_pt_gpa)
+        };
+
         let stack_top_gpa = self.vm.get_stack_top();
         let sregs = self
             .vm
@@ -173,7 +204,7 @@ impl MultiUseSandbox {
         let memory_snapshot = self.mem_mgr.snapshot(
             self.id,
             mapped_regions_vec,
-            root_pt_gpa,
+            &root_pt_gpas,
             stack_top_gpa,
             sregs,
             entrypoint,
@@ -181,6 +212,50 @@ impl MultiUseSandbox {
         let snapshot = Arc::new(memory_snapshot);
         self.snapshot = Some(snapshot.clone());
         Ok(snapshot)
+    }
+
+    /// Reads the PD roots table from the scratch bookkeeping area.
+    /// Falls back to just `[cr3]` if the guest did not write any roots.
+    fn read_pd_roots_from_scratch(&mut self, cr3: u64) -> Vec<u64> {
+        use hyperlight_common::layout::{
+            MAX_PD_ROOTS, SCRATCH_TOP_PD_ROOTS_ARRAY_OFFSET, SCRATCH_TOP_PD_ROOTS_COUNT_OFFSET,
+        };
+
+        let scratch_size = self.mem_mgr.layout.get_scratch_size();
+        let count_off = scratch_size - SCRATCH_TOP_PD_ROOTS_COUNT_OFFSET as usize;
+        let array_off = scratch_size - SCRATCH_TOP_PD_ROOTS_ARRAY_OFFSET as usize;
+
+        let roots = self
+            .mem_mgr
+            .scratch_mem
+            .with_contents(|scratch| {
+                let count = scratch
+                    .get(count_off..count_off + 4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .unwrap_or(0) as usize;
+
+                if count == 0 || count > MAX_PD_ROOTS {
+                    return vec![cr3];
+                }
+
+                let mut roots = Vec::with_capacity(count);
+                for i in 0..count {
+                    let off = array_off + i * 4;
+                    if let Some(b) = scratch.get(off..off + 4) {
+                        let gpa = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                        if gpa != 0 {
+                            roots.push(gpa as u64);
+                        }
+                    }
+                }
+                if roots.is_empty() {
+                    roots.push(cr3);
+                }
+                roots
+            })
+            .unwrap_or_else(|_| vec![cr3]);
+
+        roots
     }
 
     /// Restores the sandbox's memory to a previously captured snapshot state.

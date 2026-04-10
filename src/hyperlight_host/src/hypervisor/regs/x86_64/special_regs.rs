@@ -28,7 +28,7 @@ use windows::Win32::System::Hypervisor::*;
 use super::FromWhpRegisterError;
 
 cfg_if::cfg_if! {
-    if #[cfg(not(feature = "nanvix-unstable"))] {
+    if #[cfg(not(feature = "i686-guest"))] {
         pub(crate) const CR4_PAE: u64 = 1 << 5;
         pub(crate) const CR4_OSFXSR: u64 = 1 << 9;
         pub(crate) const CR4_OSXMMEXCPT: u64 = 1 << 10;
@@ -69,7 +69,7 @@ pub(crate) struct CommonSpecialRegisters {
 }
 
 impl CommonSpecialRegisters {
-    #[cfg(not(feature = "nanvix-unstable"))]
+    #[cfg(not(feature = "i686-guest"))]
     pub(crate) fn standard_64bit_defaults(pml4_addr: u64) -> Self {
         CommonSpecialRegisters {
             cs: CommonSegmentRegister {
@@ -104,36 +104,54 @@ impl CommonSpecialRegisters {
         }
     }
 
-    #[cfg(feature = "nanvix-unstable")]
-    pub(crate) fn standard_real_mode_defaults() -> Self {
+    /// Returns special registers for 32-bit protected mode with paging enabled.
+    /// Used for i686 guests that need CoW page tables from boot.
+    #[cfg(feature = "i686-guest")]
+    pub(crate) fn standard_32bit_paging_defaults(pd_addr: u64) -> Self {
+        // Flat 32-bit code segment: base=0, limit=4GB, 32-bit, executable
+        let code_seg = CommonSegmentRegister {
+            base: 0,
+            selector: 0x08,
+            limit: 0xFFFFFFFF,
+            type_: 11, // Execute/Read, Accessed
+            present: 1,
+            s: 1,
+            db: 1,   // 32-bit
+            g: 1,    // 4KB granularity
+            ..Default::default()
+        };
+        // Flat 32-bit data segment: base=0, limit=4GB, 32-bit, writable
+        let data_seg = CommonSegmentRegister {
+            base: 0,
+            selector: 0x10,
+            limit: 0xFFFFFFFF,
+            type_: 3, // Read/Write, Accessed
+            present: 1,
+            s: 1,
+            db: 1,   // 32-bit
+            g: 1,    // 4KB granularity
+            ..Default::default()
+        };
+        let tr_seg = CommonSegmentRegister {
+            base: 0,
+            selector: 0,
+            limit: 0xFFFF,
+            type_: 11,
+            present: 1,
+            s: 0,
+            ..Default::default()
+        };
         CommonSpecialRegisters {
-            cs: CommonSegmentRegister {
-                base: 0,
-                selector: 0,
-                limit: 0xFFFF,
-                type_: 11,
-                present: 1,
-                s: 1,
-                ..Default::default()
-            },
-            ds: CommonSegmentRegister {
-                base: 0,
-                selector: 0,
-                limit: 0xFFFF,
-                type_: 3,
-                present: 1,
-                s: 1,
-                ..Default::default()
-            },
-            tr: CommonSegmentRegister {
-                base: 0,
-                selector: 0,
-                limit: 0xFFFF,
-                type_: 11,
-                present: 1,
-                s: 0,
-                ..Default::default()
-            },
+            cs: code_seg,
+            ds: data_seg,
+            es: data_seg,
+            ss: data_seg,
+            fs: data_seg,
+            gs: data_seg,
+            tr: tr_seg,
+            cr0: 0x80010011, // PE + ET + WP (write-protect for CoW) + PG
+            cr3: pd_addr,
+            cr4: 0, // No PAE, no PSE
             ..Default::default()
         }
     }
