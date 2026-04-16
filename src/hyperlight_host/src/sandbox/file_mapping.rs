@@ -292,14 +292,14 @@ pub(crate) fn prepare_file_cow(
 
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::io::AsRawHandle;
+        use std::io::Read;
 
-        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows::Win32::System::Memory::{
-            CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY,
+            CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE,
         };
 
-        let file = std::fs::File::options().read(true).open(file_path)?;
+        let mut file = std::fs::File::options().read(true).open(file_path)?;
         let file_size = file.metadata()?.len();
         if file_size == 0 {
             log_then_return!("map_file_cow: cannot map an empty file: {:?}", file_path);
@@ -311,20 +311,34 @@ pub(crate) fn prepare_file_cow(
         })?;
         let size = size.div_ceil(page_size) * page_size;
 
-        let file_handle = HANDLE(file.as_raw_handle());
+        // Use a pagefile-backed (INVALID_HANDLE_VALUE) section rather than a
+        // file-backed one. File-backed sections fail to map across processes
+        // via MapViewOfFileNuma2 with ERROR_ACCESS_DENIED on modern Windows
+        // (VBS / Memory Integrity policies), while pagefile-backed sections
+        // work with the surrogate-process machinery used by WHvMapGpaRange2.
+        //
+        // This sacrifices zero-copy on Windows — we copy the file contents
+        // into the section once — in exchange for cross-process-map
+        // compatibility. Pagefile-backed sections must also be PAGE_READWRITE
+        // for the initial copy; page protection is tightened to read-only
+        // downstream when the surrogate view is created.
+        let size_u64 = size as u64;
+        let size_hi = (size_u64 >> 32) as u32;
+        let size_lo = (size_u64 & 0xFFFF_FFFF) as u32;
 
-        // Create a read-only file mapping object backed by the actual file.
-        // Pass 0,0 for size to use the file's actual size — Windows will
-        // NOT extend a read-only file, so requesting page-aligned size
-        // would fail for files smaller than one page.
-        let mapping_handle =
-            unsafe { CreateFileMappingW(file_handle, None, PAGE_READONLY, 0, 0, None) }
-                .map_err(|e| HyperlightError::Error(format!("CreateFileMappingW failed: {e}")))?;
+        let mapping_handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                None,
+                PAGE_READWRITE,
+                size_hi,
+                size_lo,
+                None,
+            )
+        }
+        .map_err(|e| HyperlightError::Error(format!("CreateFileMappingW failed: {e}")))?;
 
-        // Map a read-only view into the host process.
-        // Passing 0 for dwNumberOfBytesToMap maps the entire file; the OS
-        // rounds up to the next page boundary and zero-fills the remainder.
-        let view = unsafe { MapViewOfFile(mapping_handle, FILE_MAP_READ, 0, 0, 0) };
+        let view = unsafe { MapViewOfFile(mapping_handle, FILE_MAP_ALL_ACCESS, 0, 0, size) };
         if view.Value.is_null() {
             unsafe {
                 let _ = windows::Win32::Foundation::CloseHandle(mapping_handle);
@@ -333,6 +347,37 @@ pub(crate) fn prepare_file_cow(
                 "MapViewOfFile failed: {:?}",
                 std::io::Error::last_os_error()
             );
+        }
+
+        // Copy the file contents into the pagefile-backed section. The tail
+        // past file_size (up to the page-aligned `size`) stays zero-filled
+        // because pagefile-backed sections commit zeroed pages.
+        let slice = unsafe {
+            std::slice::from_raw_parts_mut(view.Value as *mut u8, file_size as usize)
+        };
+        if let Err(e) = file.read_exact(slice) {
+            unsafe {
+                use windows::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+                let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
+                let _ = windows::Win32::Foundation::CloseHandle(mapping_handle);
+            }
+            log_then_return!("map_file_cow: reading file into section failed: {e}");
+        }
+
+        // Tighten the host-side view to read-only now that the copy is
+        // complete. This preserves CoW semantics: the host cannot
+        // accidentally mutate the backing section; any guest-side writes
+        // are handled as copy-on-write at the hypervisor level.
+        {
+            use windows::Win32::System::Memory::{PAGE_PROTECTION_FLAGS, VirtualProtect};
+            let mut old_prot = PAGE_PROTECTION_FLAGS(0);
+            if let Err(e) = unsafe {
+                VirtualProtect(view.Value, size, windows::Win32::System::Memory::PAGE_READONLY, &mut old_prot)
+            } {
+                tracing::warn!("map_file_cow: VirtualProtect(PAGE_READONLY) failed: {e}");
+                // Non-fatal: the surrogate view will still be PAGE_READONLY
+                // regardless of the host view's protection.
+            }
         }
 
         Ok(PreparedFileMapping {
