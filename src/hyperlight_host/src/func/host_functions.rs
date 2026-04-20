@@ -56,6 +56,37 @@ impl Registerable for UninitializedSandbox {
     }
 }
 
+/// A `MultiUseSandbox` loaded from a persisted snapshot doesn't go through
+/// the `UninitializedSandbox → evolve()` path, so callers never have a
+/// chance to register host functions up front. Allow late registration
+/// after `from_snapshot` — the guest's host-function dispatcher looks up
+/// by name at call time, so inserting into the registry afterwards is
+/// sufficient as long as all of the guest's first host-function invocation
+/// happens after registration completes. Typical use is
+/// `let mut sbox = MultiUseSandbox::from_snapshot(s)?;
+///  sbox.register_host_function("__dispatch", |payload: Vec<u8>| { ... })?;
+///  sbox.call::<(), _>("run", args)?;`.
+impl Registerable for crate::MultiUseSandbox {
+    fn register_host_function<Args: ParameterTuple, Output: SupportedReturnType>(
+        &mut self,
+        name: &str,
+        hf: impl Into<HostFunction<Output, Args>>,
+    ) -> Result<()> {
+        let mut hfs = self
+            .host_funcs
+            .try_lock()
+            .map_err(|e| new_error!("Error locking at {}:{}: {}", file!(), line!(), e))?;
+
+        let entry = FunctionEntry {
+            function: hf.into().into(),
+            parameter_types: Args::TYPE,
+            return_type: Output::TYPE,
+        };
+
+        (*hfs).register_host_function(name.to_string(), entry)
+    }
+}
+
 /// A representation of a host function.
 /// This is a thin wrapper around a `Fn(Args) -> Result<Output>`.
 #[derive(Clone)]

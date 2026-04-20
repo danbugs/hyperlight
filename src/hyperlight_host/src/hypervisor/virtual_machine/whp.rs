@@ -119,6 +119,7 @@ impl WhpVm {
             Self::check_lapic_emulation_support()?;
 
             let p = WHvCreatePartition().map_err(|e| CreateVmError::CreateVmFd(e.into()))?;
+
             WHvSetPartitionProperty(
                 p,
                 WHvPartitionPropertyCodeProcessorCount,
@@ -128,17 +129,19 @@ impl WhpVm {
             .map_err(|e| CreateVmError::SetPartitionProperty(e.into()))?;
 
             #[cfg(feature = "hw-interrupts")]
-            Self::enable_lapic_emulation(p)?;
+            {
+                Self::enable_lapic_emulation(p)?;
+            }
 
             WHvSetupPartition(p).map_err(|e| CreateVmError::InitializeVm(e.into()))?;
+
             WHvCreateVirtualProcessor(p, 0, 0)
                 .map_err(|e| CreateVmError::CreateVcpuFd(e.into()))?;
 
-            // Initialize the LAPIC via the bulk interrupt-controller
-            // state API (individual APIC register writes via
-            // WHvSetVirtualProcessorRegisters fail with ACCESS_DENIED).
             #[cfg(feature = "hw-interrupts")]
-            Self::init_lapic_bulk(p).map_err(|e| CreateVmError::InitializeVm(e.into()))?;
+            {
+                Self::init_lapic_bulk(p).map_err(|e| CreateVmError::InitializeVm(e.into()))?;
+            }
 
             p
         };
