@@ -37,7 +37,7 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Memory::{CreateFileMappingA, FILE_MAP_ALL_ACCESS, MapViewOfFile};
 #[cfg(all(target_os = "windows", feature = "whp-no-surrogate"))]
 use windows::Win32::System::Memory::{
-    MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, VirtualAlloc, VirtualFree,
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, VirtualAlloc, VirtualFree,
 };
 #[cfg(all(target_os = "windows", not(feature = "whp-no-surrogate")))]
 use windows::core::PCSTR;
@@ -930,28 +930,11 @@ pub trait SharedMemory {
                     do_copy = false;
                 }
             }
-            #[cfg(all(target_os = "windows", feature = "whp-no-surrogate"))]
-            unsafe {
-                let inner_ptr = e.region.ptr.add(PAGE_SIZE_USIZE) as *mut c_void;
-                let inner_size = e.region.size - 2 * PAGE_SIZE_USIZE;
-                if VirtualFree(inner_ptr, inner_size, MEM_DECOMMIT).is_ok() {
-                    let p = VirtualAlloc(
-                        Some(inner_ptr),
-                        inner_size,
-                        MEM_COMMIT,
-                        PAGE_READWRITE,
-                    );
-                    if p.is_null() {
-                        // Decommitted but recommit failed — memory is
-                        // unusable, cannot fall through to fill(0).
-                        panic!(
-                            "VirtualAlloc(MEM_COMMIT) failed after MEM_DECOMMIT: {}",
-                            Error::last_os_error()
-                        );
-                    }
-                    do_copy = false;
-                }
-            }
+            // Note: on Windows+whp-no-surrogate we intentionally fall
+            // through to fill(0).  MEM_DECOMMIT+MEM_COMMIT would give
+            // fresh zero pages but WHP's GPA mapping (WHvMapGpaRange)
+            // still references the old physical pages — guest and host
+            // would see different memory.
             if do_copy {
                 e.as_mut_slice().fill(0);
             }
