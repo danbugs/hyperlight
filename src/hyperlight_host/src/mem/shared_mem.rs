@@ -30,10 +30,16 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::System::Memory::PAGE_READWRITE;
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Memory::{
-    CreateFileMappingA, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
-    PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, UnmapViewOfFile, VirtualProtect,
+    MEMORY_MAPPED_VIEW_ADDRESS, PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, UnmapViewOfFile,
+    VirtualProtect,
 };
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(feature = "whp-no-surrogate")))]
+use windows::Win32::System::Memory::{CreateFileMappingA, FILE_MAP_ALL_ACCESS, MapViewOfFile};
+#[cfg(all(target_os = "windows", feature = "whp-no-surrogate"))]
+use windows::Win32::System::Memory::{
+    MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, VirtualAlloc, VirtualFree,
+};
+#[cfg(all(target_os = "windows", not(feature = "whp-no-surrogate")))]
 use windows::core::PCSTR;
 
 use super::memory_region::{
@@ -110,19 +116,35 @@ impl Drop for HostMapping {
     }
     #[cfg(target_os = "windows")]
     fn drop(&mut self) {
-        let mem_mapped_address = MEMORY_MAPPED_VIEW_ADDRESS {
-            Value: self.ptr as *mut c_void,
-        };
-        if let Err(e) = unsafe { UnmapViewOfFile(mem_mapped_address) } {
-            tracing::error!(
-                "Failed to drop HostMapping (UnmapViewOfFile failed): {:?}",
-                e
-            );
-        }
+        if self.handle == INVALID_HANDLE_VALUE {
+            // VirtualAlloc-backed allocation (whp-no-surrogate path)
+            #[cfg(feature = "whp-no-surrogate")]
+            unsafe {
+                if let Err(e) = VirtualFree(self.ptr as *mut c_void, 0, MEM_RELEASE) {
+                    tracing::error!(
+                        "Failed to drop HostMapping (VirtualFree failed): {:?}",
+                        e
+                    );
+                }
+            }
+        } else {
+            let mem_mapped_address = MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.ptr as *mut c_void,
+            };
+            if let Err(e) = unsafe { UnmapViewOfFile(mem_mapped_address) } {
+                tracing::error!(
+                    "Failed to drop HostMapping (UnmapViewOfFile failed): {:?}",
+                    e
+                );
+            }
 
-        let file_handle: HANDLE = self.handle;
-        if let Err(e) = unsafe { CloseHandle(file_handle) } {
-            tracing::error!("Failed to  drop HostMapping (CloseHandle failed): {:?}", e);
+            let file_handle: HANDLE = self.handle;
+            if let Err(e) = unsafe { CloseHandle(file_handle) } {
+                tracing::error!(
+                    "Failed to  drop HostMapping (CloseHandle failed): {:?}",
+                    e
+                );
+            }
         }
     }
 }
@@ -429,7 +451,7 @@ impl ExclusiveSharedMemory {
     /// size in bytes. The region will be surrounded by guard pages.
     ///
     /// Return `Err` if shared memory could not be allocated.
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", not(feature = "whp-no-surrogate")))]
     #[instrument(skip_all, parent = Span::current(), level= "Trace")]
     pub fn new(min_size_bytes: usize) -> Result<Self> {
         if min_size_bytes == 0 {
@@ -539,6 +561,77 @@ impl ExclusiveSharedMemory {
                 ptr: addr.Value as *mut u8,
                 size: total_size,
                 handle,
+            }),
+        })
+    }
+
+    #[cfg(all(target_os = "windows", feature = "whp-no-surrogate"))]
+    #[instrument(skip_all, parent = Span::current(), level= "Trace")]
+    pub fn new(min_size_bytes: usize) -> Result<Self> {
+        if min_size_bytes == 0 {
+            return Err(new_error!("Cannot create shared memory with size 0"));
+        }
+
+        let total_size = min_size_bytes
+            .checked_add(2 * PAGE_SIZE_USIZE)
+            .ok_or_else(|| new_error!("Memory required for sandbox exceeded {}", usize::MAX))?;
+
+        if total_size % PAGE_SIZE_USIZE != 0 {
+            return Err(new_error!(
+                "shared memory must be a multiple of {}",
+                PAGE_SIZE_USIZE
+            ));
+        }
+
+        if total_size > isize::MAX as usize {
+            return Err(HyperlightError::MemoryRequestTooBig(
+                total_size,
+                isize::MAX as usize,
+            ));
+        }
+
+        let addr = unsafe {
+            VirtualAlloc(None, total_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        };
+
+        if addr.is_null() {
+            log_then_return!(HyperlightError::MemoryAllocationFailed(
+                Error::last_os_error().raw_os_error()
+            ));
+        }
+
+        let mut unused_out_old_prot_flags = PAGE_PROTECTION_FLAGS(0);
+
+        let first_guard_page_start = addr;
+        if let Err(e) = unsafe {
+            VirtualProtect(
+                first_guard_page_start,
+                PAGE_SIZE_USIZE,
+                PAGE_NOACCESS,
+                &mut unused_out_old_prot_flags,
+            )
+        } {
+            log_then_return!(WindowsAPIError(e.clone()));
+        }
+
+        let last_guard_page_start = unsafe { addr.add(total_size - PAGE_SIZE_USIZE) };
+        if let Err(e) = unsafe {
+            VirtualProtect(
+                last_guard_page_start,
+                PAGE_SIZE_USIZE,
+                PAGE_NOACCESS,
+                &mut unused_out_old_prot_flags,
+            )
+        } {
+            log_then_return!(WindowsAPIError(e.clone()));
+        }
+
+        Ok(Self {
+            #[allow(clippy::arc_with_non_send_sync)]
+            region: Arc::new(HostMapping {
+                ptr: addr as *mut u8,
+                size: total_size,
+                handle: INVALID_HANDLE_VALUE,
             }),
         })
     }
@@ -835,6 +928,22 @@ pub trait SharedMemory {
                 );
                 if ret == 0 {
                     do_copy = false;
+                }
+            }
+            #[cfg(all(target_os = "windows", feature = "whp-no-surrogate"))]
+            unsafe {
+                let inner_ptr = e.region.ptr.add(PAGE_SIZE_USIZE) as *mut c_void;
+                let inner_size = e.region.size - 2 * PAGE_SIZE_USIZE;
+                if VirtualFree(inner_ptr, inner_size, MEM_DECOMMIT).is_ok() {
+                    let p = VirtualAlloc(
+                        Some(inner_ptr),
+                        inner_size,
+                        MEM_COMMIT,
+                        PAGE_READWRITE,
+                    );
+                    if !p.is_null() {
+                        do_copy = false;
+                    }
                 }
             }
             if do_copy {
