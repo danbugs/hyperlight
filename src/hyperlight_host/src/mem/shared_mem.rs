@@ -116,9 +116,8 @@ impl Drop for HostMapping {
     }
     #[cfg(target_os = "windows")]
     fn drop(&mut self) {
+        #[cfg(feature = "whp-no-surrogate")]
         if self.handle == INVALID_HANDLE_VALUE {
-            // VirtualAlloc-backed allocation (whp-no-surrogate path)
-            #[cfg(feature = "whp-no-surrogate")]
             unsafe {
                 if let Err(e) = VirtualFree(self.ptr as *mut c_void, 0, MEM_RELEASE) {
                     tracing::error!(
@@ -127,24 +126,25 @@ impl Drop for HostMapping {
                     );
                 }
             }
-        } else {
-            let mem_mapped_address = MEMORY_MAPPED_VIEW_ADDRESS {
-                Value: self.ptr as *mut c_void,
-            };
-            if let Err(e) = unsafe { UnmapViewOfFile(mem_mapped_address) } {
-                tracing::error!(
-                    "Failed to drop HostMapping (UnmapViewOfFile failed): {:?}",
-                    e
-                );
-            }
+            return;
+        }
 
-            let file_handle: HANDLE = self.handle;
-            if let Err(e) = unsafe { CloseHandle(file_handle) } {
-                tracing::error!(
-                    "Failed to  drop HostMapping (CloseHandle failed): {:?}",
-                    e
-                );
-            }
+        let mem_mapped_address = MEMORY_MAPPED_VIEW_ADDRESS {
+            Value: self.ptr as *mut c_void,
+        };
+        if let Err(e) = unsafe { UnmapViewOfFile(mem_mapped_address) } {
+            tracing::error!(
+                "Failed to drop HostMapping (UnmapViewOfFile failed): {:?}",
+                e
+            );
+        }
+
+        let file_handle: HANDLE = self.handle;
+        if let Err(e) = unsafe { CloseHandle(file_handle) } {
+            tracing::error!(
+                "Failed to drop HostMapping (CloseHandle failed): {:?}",
+                e
+            );
         }
     }
 }
@@ -941,9 +941,15 @@ pub trait SharedMemory {
                         MEM_COMMIT,
                         PAGE_READWRITE,
                     );
-                    if !p.is_null() {
-                        do_copy = false;
+                    if p.is_null() {
+                        // Decommitted but recommit failed — memory is
+                        // unusable, cannot fall through to fill(0).
+                        panic!(
+                            "VirtualAlloc(MEM_COMMIT) failed after MEM_DECOMMIT: {}",
+                            Error::last_os_error()
+                        );
                     }
+                    do_copy = false;
                 }
             }
             if do_copy {
