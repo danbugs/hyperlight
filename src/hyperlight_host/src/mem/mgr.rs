@@ -155,6 +155,9 @@ pub(crate) struct SandboxMemoryManager<S: SharedMemory> {
     /// restored snapshot's own generation number so the guest-visible
     /// counter tracks which snapshot the sandbox is a clone of.
     pub(crate) snapshot_count: u64,
+    /// Cached page table bytes from the snapshot — avoids re-faulting
+    /// mmap pages on every restore.
+    cached_pt_bytes: Option<Vec<u8>>,
 }
 
 /// Buffer for building guest page tables during snapshot creation.
@@ -290,6 +293,7 @@ where
             mapped_rgns: 0,
             abort_buffer: Vec::new(),
             snapshot_count: 0,
+            cached_pt_bytes: None,
         }
     }
 
@@ -363,6 +367,7 @@ impl SandboxMemoryManager<ExclusiveSharedMemory> {
             mapped_rgns: self.mapped_rgns,
             abort_buffer: self.abort_buffer,
             snapshot_count: self.snapshot_count,
+            cached_pt_bytes: None,
         };
         let guest_mgr = SandboxMemoryManager {
             shared_mem: gshm,
@@ -372,6 +377,7 @@ impl SandboxMemoryManager<ExclusiveSharedMemory> {
             mapped_rgns: self.mapped_rgns,
             abort_buffer: Vec::new(), // Guest doesn't need abort buffer
             snapshot_count: self.snapshot_count,
+            cached_pt_bytes: None,
         };
         host_mgr.update_scratch_bookkeeping()?;
         Ok((host_mgr, guest_mgr))
@@ -548,8 +554,16 @@ impl SandboxMemoryManager<HostSharedMemory> {
         };
         let new_scratch_size = snapshot.layout().get_scratch_size();
         let gscratch = if new_scratch_size == self.scratch_mem.mem_size() {
-            self.scratch_mem.zero()?;
-            None
+            #[cfg(all(target_os = "windows", feature = "whp-no-surrogate"))]
+            {
+                self.scratch_mem.fast_zero_replace_pages()?;
+                Some(self.scratch_mem.to_guest())
+            }
+            #[cfg(not(all(target_os = "windows", feature = "whp-no-surrogate")))]
+            {
+                self.scratch_mem.zero()?;
+                None
+            }
         } else {
             let new_scratch_mem = ExclusiveSharedMemory::new(new_scratch_size)?;
             let (hscratch, gscratch) = new_scratch_mem.build();
@@ -616,27 +630,28 @@ impl SandboxMemoryManager<HostSharedMemory> {
             SandboxMemoryLayout::STACK_POINTER_SIZE_BYTES,
         )?;
 
-        // Copy page tables from `shared_mem` into scratch. PT bytes
-        // are appended to the snapshot blob at build time and live
-        // just past the end of the guest-visible KVM slot (see
-        // `Snapshot::new`). Keeping them outside the KVM slot avoids
-        // overlapping with `map_file_cow` regions installed
-        // immediately after the snapshot in the guest PA space.
+        // Copy page tables from `shared_mem` into scratch. Cache the
+        // bytes so subsequent restores don't re-fault mmap pages.
         let snapshot_pt_end = self.shared_mem.mem_size();
         let snapshot_pt_size = self.layout.get_pt_size();
         let snapshot_pt_start = snapshot_pt_end - snapshot_pt_size;
-        self.scratch_mem.with_exclusivity(|scratch| {
+        if self.cached_pt_bytes.is_none() {
             #[cfg(not(unshared_snapshot_mem))]
-            let bytes = &self.shared_mem.as_slice()[snapshot_pt_start..snapshot_pt_end];
+            {
+                self.cached_pt_bytes =
+                    Some(self.shared_mem.as_slice()[snapshot_pt_start..snapshot_pt_end].to_vec());
+            }
             #[cfg(unshared_snapshot_mem)]
-            let bytes = {
+            {
                 let mut bytes = vec![0u8; snapshot_pt_size];
                 self.shared_mem
                     .copy_to_slice(&mut bytes, snapshot_pt_start)?;
-                bytes
-            };
-            #[allow(clippy::needless_borrow)]
-            scratch.copy_from_slice(&bytes, self.layout.get_pt_base_scratch_offset())
+                self.cached_pt_bytes = Some(bytes);
+            }
+        }
+        let pt_bytes = self.cached_pt_bytes.as_ref().unwrap();
+        self.scratch_mem.with_exclusivity(|scratch| {
+            scratch.copy_from_slice(pt_bytes, self.layout.get_pt_base_scratch_offset())
         })??;
 
         Ok(())

@@ -37,7 +37,7 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Memory::{CreateFileMappingA, FILE_MAP_ALL_ACCESS, MapViewOfFile};
 #[cfg(all(target_os = "windows", feature = "whp-no-surrogate"))]
 use windows::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, VirtualAlloc, VirtualFree,
+    MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, VirtualAlloc, VirtualFree,
 };
 #[cfg(all(target_os = "windows", not(feature = "whp-no-surrogate")))]
 use windows::core::PCSTR;
@@ -692,6 +692,29 @@ impl ExclusiveSharedMemory {
         unsafe { std::slice::from_raw_parts(self.base_ptr(), self.mem_size()) }
     }
 
+    /// Replace inner pages (between guard pages) with fresh zero pages via
+    /// MEM_DECOMMIT+MEM_COMMIT. The caller MUST unmap the GPA range before
+    /// calling this and remap it after, because decommit+recommit replaces
+    /// the underlying physical pages.
+    #[cfg(all(target_os = "windows", feature = "whp-no-surrogate"))]
+    pub(crate) fn fast_zero_replace_pages(&mut self) -> Result<()> {
+        let inner_ptr = unsafe { self.region.ptr.add(PAGE_SIZE_USIZE) as *mut c_void };
+        let inner_size = self.region.size - 2 * PAGE_SIZE_USIZE;
+        unsafe {
+            VirtualFree(inner_ptr, inner_size, MEM_DECOMMIT).map_err(|e| {
+                new_error!("fast_zero: MEM_DECOMMIT failed: {e:?}")
+            })?;
+            let p = VirtualAlloc(Some(inner_ptr), inner_size, MEM_COMMIT, PAGE_READWRITE);
+            if p.is_null() {
+                return Err(new_error!(
+                    "fast_zero: MEM_COMMIT failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Copy the entire contents of `self` into a `Vec<u8>`, then return it
     #[instrument(err(Debug), skip_all, parent = Span::current(), level= "Trace")]
     #[cfg(test)]
@@ -996,6 +1019,36 @@ unsafe impl AllValid for i64 {}
 unsafe impl AllValid for [u8; 16] {}
 
 impl HostSharedMemory {
+    /// Replace inner pages with fresh zero pages via MEM_DECOMMIT+MEM_COMMIT.
+    /// The caller MUST unmap the GPA range before calling and remap after.
+    #[cfg(all(target_os = "windows", feature = "whp-no-surrogate"))]
+    pub(crate) fn fast_zero_replace_pages(&self) -> Result<()> {
+        let inner_ptr = unsafe { self.region.ptr.add(PAGE_SIZE_USIZE) as *mut c_void };
+        let inner_size = self.region.size - 2 * PAGE_SIZE_USIZE;
+        unsafe {
+            VirtualFree(inner_ptr, inner_size, MEM_DECOMMIT).map_err(|e| {
+                new_error!("fast_zero: MEM_DECOMMIT failed: {e:?}")
+            })?;
+            let p = VirtualAlloc(Some(inner_ptr), inner_size, MEM_COMMIT, PAGE_READWRITE);
+            if p.is_null() {
+                return Err(new_error!(
+                    "fast_zero: MEM_COMMIT failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Create a GuestSharedMemory that shares the same backing region.
+    #[cfg(all(target_os = "windows", feature = "whp-no-surrogate"))]
+    pub(crate) fn to_guest(&self) -> GuestSharedMemory {
+        GuestSharedMemory {
+            region: self.region.clone(),
+            lock: self.lock.clone(),
+        }
+    }
+
     /// Read a value of type T, whose representation is the same
     /// between the sandbox and the host, and which has no invalid bit
     /// patterns
