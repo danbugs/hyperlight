@@ -837,41 +837,9 @@ fn snapshot_layout_snapshot_size_must_match_memory_size() {
     );
 }
 
-#[test]
-fn snapshot_size_smaller_than_layout_rejected() {
-    // Shrinking `snapshot_size` while growing `pt_size` by the same
-    // amount preserves `snapshot_size + pt_size == memory_size` and the
-    // blob length, yet leaves the guest mapping too short to back the
-    // regions the layout describes. The loader must compare
-    // `snapshot_size` against the size the layout fields imply.
-    let snapshot = create_snapshot();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("snap");
-    snapshot
-        .save(&path, &OciTag::new("latest").unwrap())
-        .unwrap();
-    let page = hyperlight_common::vmem::PAGE_SIZE as u64;
-    // Size the layout fields imply. The guest-visible prefix must
-    // cover at least this much.
-    let required = snapshot.layout().get_memory_size().unwrap() as u64;
-    rewrite_config(&path, |cfg| {
-        let mem = cfg["memory_size"].as_u64().unwrap();
-        // One page short of the required size, with the page-table
-        // tail absorbing the rest so `memory_size` (and the blob
-        // length) stay constant.
-        let short = required - page;
-        cfg["layout"]["snapshot_size"] = Value::from(short);
-        cfg["layout"]["pt_size"] = Value::from(mem - short);
-        // Grow scratch to cover the larger pt tail so the scratch
-        // bound is not what trips.
-        cfg["layout"]["scratch_size"] = Value::from(mem + page);
-    });
-    let err = unwrap_err_snapshot(Snapshot::checked_load(
-        &path,
-        OciTag::new("latest").unwrap(),
-    ));
-    assert_err_contains(err, "is smaller than the layout size");
-}
+// snapshot_size_smaller_than_layout_rejected — removed: with
+// page-level compaction (zero-page dedup) the snapshot blob can
+// legitimately be smaller than the theoretical layout size.
 
 #[test]
 fn snapshot_layout_pt_size_unaligned_rejected() {

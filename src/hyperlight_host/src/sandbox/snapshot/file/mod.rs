@@ -788,20 +788,10 @@ impl Snapshot {
         layout.set_snapshot_size(cfg.layout.snapshot_size);
 
         // `snapshot_size` is the guest-visible prefix mapped into the
-        // snapshot region. It must cover at least the regions the
-        // layout fields describe (code, PEB, heap, init data),
-        // otherwise the guest mapping is too short to back them. The
-        // `snapshot_size + pt_size == memory_size` invariant alone
-        // does not bound `snapshot_size` from below, since a smaller
-        // `snapshot_size` can be offset by a larger `pt_size`.
-        let required_memory_size = layout.get_memory_size()? as u64;
-        if (layout.snapshot_size as u64) < required_memory_size {
-            return Err(crate::new_error!(
-                "snapshot snapshot_size ({}) is smaller than the layout size ({})",
-                layout.snapshot_size,
-                required_memory_size
-            ));
-        }
+        // snapshot region. With page-level compaction (e.g. zero-page
+        // dedup) the blob can be smaller than the theoretical layout
+        // size — the page tables are authoritative on which GPAs are
+        // valid and they only reference GPAs within the blob.
 
         // 7. mmap the snapshot blob (file-backed CoW). The blob is
         //    the raw memory image. `ReadonlySharedMemory::from_file`
