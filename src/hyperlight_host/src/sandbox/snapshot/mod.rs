@@ -406,6 +406,13 @@ impl Snapshot {
                 // compacting leaves into a dense snapshot blob.
                 // TODO: Look for opportunities to hugepage map
                 let mut snapshot_memory: Vec<u8> = Vec::new();
+
+                // Allocate a single canonical zero page at the start of
+                // the snapshot blob.  Every all-zero guest page will
+                // point here instead of storing its own copy.
+                let zero_page_gpa = SandboxMemoryLayout::BASE_ADDRESS;
+                snapshot_memory.resize(PAGE_SIZE, 0u8);
+
                 let pt_buf = GuestPageTableBuffer::new(layout.get_pt_base_gpa() as usize);
                 for mapping in walk {
                     // Drop the scratch region and (on amd64) the
@@ -435,14 +442,21 @@ impl Snapshot {
                         }),
                         MappingKind::Unmapped => continue,
                     };
-                    let new_gpa = phys_seen.entry(mapping.phys_base).or_insert_with(|| {
-                        let new_offset = snapshot_memory.len();
-                        snapshot_memory.extend(contents);
-                        new_offset + SandboxMemoryLayout::BASE_ADDRESS
-                    });
+
+                    // Zero-page dedup: if the entire page is zeroes,
+                    // reuse the canonical zero page instead of copying.
+                    let new_gpa = if contents.iter().all(|&b| b == 0) {
+                        zero_page_gpa
+                    } else {
+                        *phys_seen.entry(mapping.phys_base).or_insert_with(|| {
+                            let new_offset = snapshot_memory.len();
+                            snapshot_memory.extend(contents);
+                            new_offset + SandboxMemoryLayout::BASE_ADDRESS
+                        })
+                    };
 
                     let compacted = Mapping {
-                        phys_base: *new_gpa as u64,
+                        phys_base: new_gpa as u64,
                         virt_base: mapping.virt_base,
                         len: PAGE_SIZE as u64,
                         kind,
