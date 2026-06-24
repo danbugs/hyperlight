@@ -37,6 +37,8 @@ use windows::Win32::System::Memory::{
     UnmapViewOfFile, VIRTUAL_ALLOCATION_TYPE, VIRTUAL_FREE_TYPE, VirtualAlloc2, VirtualFree,
     VirtualProtect,
 };
+#[cfg(all(target_os = "windows", feature = "whp-no-surrogate"))]
+use windows::Win32::System::Memory::{MEM_COMMIT, VirtualAlloc};
 #[cfg(target_os = "windows")]
 use windows::core::PCSTR;
 
@@ -133,6 +135,12 @@ enum WindowsMapping {
         trailing: Placeholder,
         file_mapping: FileMapping,
     },
+    /// Direct `VirtualAlloc`-backed allocation used with
+    /// `whp-no-surrogate`. No file mapping or surrogate process
+    /// needed — memory is mapped into the partition with
+    /// `WHvMapGpaRange` directly from the host address.
+    #[cfg(feature = "whp-no-surrogate")]
+    DirectAlloc(DirectAllocation),
 }
 
 impl HostMapping {
@@ -146,6 +154,8 @@ impl HostMapping {
         match &self.mapping {
             WindowsMapping::Anonymous { view, .. } => view.addr as *mut u8,
             WindowsMapping::FileBacked { leading, .. } => leading.addr as *mut u8,
+            #[cfg(feature = "whp-no-surrogate")]
+            WindowsMapping::DirectAlloc(alloc) => alloc.addr as *mut u8,
         }
     }
 
@@ -164,6 +174,8 @@ impl HostMapping {
                 trailing,
                 ..
             } => leading.size + view.len + trailing.size,
+            #[cfg(feature = "whp-no-surrogate")]
+            WindowsMapping::DirectAlloc(alloc) => alloc.size,
         }
     }
 
@@ -173,6 +185,8 @@ impl HostMapping {
         match &self.mapping {
             WindowsMapping::Anonymous { file_mapping, .. }
             | WindowsMapping::FileBacked { file_mapping, .. } => file_mapping.0,
+            #[cfg(feature = "whp-no-surrogate")]
+            WindowsMapping::DirectAlloc { .. } => INVALID_HANDLE_VALUE,
         }
     }
 }
@@ -248,6 +262,31 @@ impl Drop for FileMapping {
                 tracing::error!(
                     "FileMapping::drop(handle={:?}) CloseHandle failed: {:?}",
                     self.0,
+                    e
+                );
+            }
+        }
+    }
+}
+
+/// RAII guard for a `VirtualAlloc`-backed allocation (whp-no-surrogate).
+/// Calls `VirtualFree(MEM_RELEASE)` on drop.
+#[cfg(all(target_os = "windows", feature = "whp-no-surrogate"))]
+#[derive(Debug)]
+struct DirectAllocation {
+    addr: *mut c_void,
+    size: usize,
+}
+
+#[cfg(all(target_os = "windows", feature = "whp-no-surrogate"))]
+impl Drop for DirectAllocation {
+    fn drop(&mut self) {
+        unsafe {
+            if let Err(e) = VirtualFree(self.addr, 0, MEM_RELEASE) {
+                tracing::error!(
+                    "DirectAllocation::drop(addr={:?}, size={}) VirtualFree failed: {:?}",
+                    self.addr,
+                    self.size,
                     e
                 );
             }
@@ -656,8 +695,6 @@ impl ExclusiveSharedMemory {
             ));
         }
 
-        // usize and isize are guaranteed to be the same size, and
-        // isize::MAX should be positive, so this cast should be safe.
         if total_size > isize::MAX as usize {
             return Err(HyperlightError::MemoryRequestTooBig(
                 total_size,
@@ -665,6 +702,24 @@ impl ExclusiveSharedMemory {
             ));
         }
 
+        let mapping = Self::allocate_mapping(total_size)?;
+        let base_addr = match &mapping {
+            WindowsMapping::Anonymous { view, .. } => view.addr,
+            #[cfg(feature = "whp-no-surrogate")]
+            WindowsMapping::DirectAlloc(alloc) => alloc.addr,
+            _ => unreachable!(),
+        };
+
+        Self::set_guard_pages(base_addr, total_size)?;
+
+        Ok(Self {
+            #[allow(clippy::arc_with_non_send_sync)]
+            region: Arc::new(HostMapping { mapping }),
+        })
+    }
+
+    #[cfg(all(target_os = "windows", not(feature = "whp-no-surrogate")))]
+    fn allocate_mapping(total_size: usize) -> Result<WindowsMapping> {
         let mut dwmaximumsizehigh = 0;
         let mut dwmaximumsizelow = 0;
 
@@ -673,16 +728,11 @@ impl ExclusiveSharedMemory {
             dwmaximumsizelow = (total_size & 0xFFFFFFFF) as u32;
         }
 
-        // Allocate the memory use CreateFileMapping instead of VirtualAlloc
-        // This allows us to map the memory into the surrogate process using MapViewOfFile2
-
-        let flags = PAGE_READWRITE;
-
         let handle = unsafe {
             CreateFileMappingA(
                 INVALID_HANDLE_VALUE,
                 None,
-                flags,
+                PAGE_READWRITE,
                 dwmaximumsizehigh,
                 dwmaximumsizelow,
                 PCSTR::null(),
@@ -696,63 +746,58 @@ impl ExclusiveSharedMemory {
         }
         let file_mapping = FileMapping(handle);
 
-        let file_map = FILE_MAP_ALL_ACCESS;
-        let addr = unsafe { MapViewOfFile(file_mapping.0, file_map, 0, 0, 0) };
-
+        let addr = unsafe { MapViewOfFile(file_mapping.0, FILE_MAP_ALL_ACCESS, 0, 0, 0) };
         if addr.Value.is_null() {
             log_then_return!(HyperlightError::MemoryAllocationFailed(
                 Error::last_os_error().raw_os_error()
             ));
         }
-        let view = MappedView {
-            addr: addr.Value,
-            len: total_size,
+
+        Ok(WindowsMapping::Anonymous {
+            view: MappedView {
+                addr: addr.Value,
+                len: total_size,
+            },
+            file_mapping,
+        })
+    }
+
+    #[cfg(all(target_os = "windows", feature = "whp-no-surrogate"))]
+    fn allocate_mapping(total_size: usize) -> Result<WindowsMapping> {
+        let addr = unsafe {
+            VirtualAlloc(None, total_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
         };
 
-        // Set the first and last pages to be guard pages
+        if addr.is_null() {
+            log_then_return!(HyperlightError::MemoryAllocationFailed(
+                Error::last_os_error().raw_os_error()
+            ));
+        }
 
-        let mut unused_out_old_prot_flags = PAGE_PROTECTION_FLAGS(0);
+        Ok(WindowsMapping::DirectAlloc(DirectAllocation {
+            addr,
+            size: total_size,
+        }))
+    }
 
-        // If the following calls to VirtualProtect are changed make sure to update the calls to VirtualProtectEx in surrogate_process_manager.rs
+    #[cfg(target_os = "windows")]
+    fn set_guard_pages(base: *mut c_void, total_size: usize) -> Result<()> {
+        let mut unused = PAGE_PROTECTION_FLAGS(0);
 
-        let first_guard_page_start = view.addr;
         if let Err(e) = unsafe {
-            VirtualProtect(
-                first_guard_page_start,
-                PAGE_SIZE_USIZE,
-                PAGE_NOACCESS,
-                &mut unused_out_old_prot_flags,
-            )
+            VirtualProtect(base, PAGE_SIZE_USIZE, PAGE_NOACCESS, &mut unused)
         } {
             log_then_return!(WindowsAPIError(e.clone()));
         }
 
-        let last_guard_page_start = unsafe { view.addr.add(total_size - PAGE_SIZE_USIZE) };
+        let last = unsafe { base.add(total_size - PAGE_SIZE_USIZE) };
         if let Err(e) = unsafe {
-            VirtualProtect(
-                last_guard_page_start,
-                PAGE_SIZE_USIZE,
-                PAGE_NOACCESS,
-                &mut unused_out_old_prot_flags,
-            )
+            VirtualProtect(last, PAGE_SIZE_USIZE, PAGE_NOACCESS, &mut unused)
         } {
             log_then_return!(WindowsAPIError(e.clone()));
         }
 
-        Ok(Self {
-            // HostMapping is only non-Send/Sync because raw pointers
-            // are not ("as a lint", as the Rust docs say). We don't
-            // want to mark HostMapping Send/Sync immediately, because
-            // that could socially imply that it's "safe" to use
-            // unsafe accesses from multiple threads at once. Instead, we
-            // directly impl Send and Sync on this type. Since this
-            // type does have Send and Sync manually impl'd, the Arc
-            // is not pointless as the lint suggests.
-            #[allow(clippy::arc_with_non_send_sync)]
-            region: Arc::new(HostMapping {
-                mapping: WindowsMapping::Anonymous { view, file_mapping },
-            }),
-        })
+        Ok(())
     }
 
     /// Internal helper method to get the backing memory as a mutable slice.

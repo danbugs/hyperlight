@@ -40,9 +40,9 @@ use crate::hypervisor::gdb::{
 };
 #[cfg(gdb)]
 use crate::hypervisor::gdb::{DebugError, DebugMemoryAccessError};
-use crate::hypervisor::regs::{
-    CommonDebugRegs, CommonFpu, CommonRegisters, CommonSpecialRegisters,
-};
+use crate::hypervisor::regs::{CommonFpu, CommonRegisters, CommonSpecialRegisters};
+#[cfg(test)]
+use crate::hypervisor::regs::CommonDebugRegs;
 #[cfg(not(gdb))]
 use crate::hypervisor::virtual_machine::VirtualMachine;
 #[cfg(kvm)]
@@ -344,14 +344,14 @@ impl HyperlightVm {
         cr3: u64,
         sregs: &CommonSpecialRegisters,
     ) -> std::result::Result<(), RegisterError> {
-        self.vm.set_regs(&CommonRegisters {
-            rflags: 1 << 1, // Reserved bit always set
-            ..Default::default()
-        })?;
-        self.vm.set_debug_regs(&CommonDebugRegs::default())?;
+        let mut sregs = *sregs;
+        sregs.cr3 = cr3;
+
+        self.vm.reset_vcpu_bulk(&sregs)?;
         self.vm.reset_xsave()?;
 
-        self.apply_sregs(cr3, sregs)
+        self.pending_tlb_flush = true;
+        Ok(())
     }
 
     /// Apply special registers and mark TLB for flush.
