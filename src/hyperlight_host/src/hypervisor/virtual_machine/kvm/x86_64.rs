@@ -208,10 +208,6 @@ impl KvmVm {
             match self.vcpu_fd.run() {
                 Ok(VcpuExit::IoOut(port, data)) => {
                     if port == VmAction::Halt as u16 {
-                        // Stop the timer thread before returning.
-                        if let Some(mut t) = self.timer.take() {
-                            t.stop();
-                        }
                         return Ok(VmExit::Halt());
                     }
                     if port == VmAction::PvTimerConfig as u16 {
@@ -236,7 +232,9 @@ impl KvmVm {
                     });
                 }
                 Err(e) => match e.errno() {
-                    libc::EINTR => return Ok(VmExit::Cancelled()),
+                    libc::EINTR => {
+                        return Ok(VmExit::Cancelled());
+                    }
                     libc::EAGAIN => continue,
                     _ => return Err(RunVcpuError::Unknown(e.into())),
                 },
@@ -261,8 +259,18 @@ impl KvmVm {
                 return;
             }
         };
+        // Capture the VCPU thread ID so the timer thread can force a VM
+        // exit via signal. In nested KVM (e.g. Azure Hyper-V), the
+        // kvm_vcpu_kick IPI does not reach a spinning VCPU, so the
+        // irqfd-injected interrupt is never delivered. Sending a signal
+        // forces KVM_RUN to return EINTR; the outer run loop treats the
+        // unmatched EINTR as a stale kick and re-enters KVM_RUN, at
+        // which point KVM picks up the pending irqfd interrupt.
+        let vcpu_tid = unsafe { libc::pthread_self() } as u64;
+        let signal = libc::SIGRTMIN();
         handle_pv_timer_config(&mut self.timer, data, move || {
             let _ = eventfd_clone.write(1);
+            unsafe { libc::pthread_kill(vcpu_tid as libc::pthread_t, signal) };
         });
     }
 
