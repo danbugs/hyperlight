@@ -63,6 +63,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 * Reject snapshot capture while guest-owned transport buffers are retained.
 * Use the reclaimed stack pages to raise the default G2H and H2G pools to 12
   and 8 pages.
+* On KVM, restore resets scratch in place. The pages a guest uses on each run
+  are zeroed and stay mapped, so its next run takes no faults on them. Up to
+  16 MiB of scratch per sandbox stays resident between runs.
 
 ### Removed
 * `RunPool` and the run-specific `AllocError::InvalidAlign` variant.

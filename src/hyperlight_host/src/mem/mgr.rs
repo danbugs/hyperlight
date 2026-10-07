@@ -15,6 +15,7 @@ use hyperlight_common::vmem::{BasicMapping, MappingKind};
 use tracing::{Span, instrument};
 
 use super::layout::SandboxMemoryLayout;
+use super::scratch_reset::ScratchReset;
 use super::shared_mem::{
     ExclusiveSharedMemory, GuestSharedMemory, HostSharedMemory, ReadonlySharedMemory, SharedMemory,
 };
@@ -163,6 +164,8 @@ pub(crate) struct SandboxMemoryManager<S: SharedMemory> {
     pub(crate) h2g_consumer: Option<H2gConsumer>,
     /// Correlation ID sequence survives consumer replacement and manager cloning.
     next_guest_cid: u32,
+    /// How scratch resets keep or drop backed pages.
+    pub(crate) scratch_reset: ScratchReset,
 }
 
 impl<S: Clone + SharedMemory> Clone for SandboxMemoryManager<S> {
@@ -178,6 +181,8 @@ impl<S: Clone + SharedMemory> Clone for SandboxMemoryManager<S> {
             g2h_consumer: None,
             h2g_consumer: None,
             next_guest_cid: self.next_guest_cid,
+            // What a reset learned is the original's, about its own resets.
+            scratch_reset: ScratchReset::default(),
         }
     }
 }
@@ -318,6 +323,7 @@ where
             g2h_consumer: None,
             h2g_consumer: None,
             next_guest_cid: 1,
+            scratch_reset: ScratchReset::default(),
         }
     }
 
@@ -372,6 +378,7 @@ impl SandboxMemoryManager<ExclusiveSharedMemory> {
             g2h_consumer: None,
             h2g_consumer: None,
             next_guest_cid: self.next_guest_cid,
+            scratch_reset: self.scratch_reset,
         };
         let guest_mgr = SandboxMemoryManager {
             shared_mem: gshm,
@@ -384,6 +391,7 @@ impl SandboxMemoryManager<ExclusiveSharedMemory> {
             g2h_consumer: None,
             h2g_consumer: None,
             next_guest_cid: self.next_guest_cid,
+            scratch_reset: ScratchReset::default(),
         };
         host_mgr.update_scratch_bookkeeping()?;
 
@@ -706,7 +714,7 @@ impl SandboxMemoryManager<HostSharedMemory> {
         let gscratch = if new_scratch_size == self.scratch_mem.mem_size() {
             // zero_or_replace picks the fastest zeroing strategy for
             // the current platform (see SharedMemory::zero_or_replace).
-            self.scratch_mem.zero_or_replace()?
+            self.scratch_mem.zero_or_replace(&mut self.scratch_reset)?
         } else {
             let new_scratch_mem = ExclusiveSharedMemory::new(new_scratch_size)?;
             let (hscratch, gscratch) = new_scratch_mem.build();
@@ -716,6 +724,7 @@ impl SandboxMemoryManager<HostSharedMemory> {
             // mapping, so it won't actually be deallocated until it
             // has been unmapped from the VM.
             self.scratch_mem = hscratch;
+            self.scratch_reset = ScratchReset::default();
             Some(gscratch)
         };
         self.layout = *snapshot.layout();
