@@ -30,6 +30,7 @@ use windows::core::PCSTR;
 use super::memory_region::{
     HostGuestMemoryRegion, MemoryRegion, MemoryRegionFlags, MemoryRegionKind, MemoryRegionType,
 };
+use super::scratch_reset::ScratchReset;
 use crate::log_then_return;
 
 type Result<T> = core::result::Result<T, SharedMemoryError>;
@@ -1480,10 +1481,14 @@ impl HostSharedMemory {
 
 impl HostSharedMemory {
     /// Reset this memory region to all-zeros, choosing the fastest
-    /// strategy for the current platform and hypervisor configuration.
+    /// strategy for the current platform and hypervisor.
     ///
-    /// On Linux/KVM (without mshv3), uses `MADV_DONTNEED` for lazy
-    /// zeroing.  On Linux/mshv3, falls through to `fill(0)`.
+    /// On KVM, `state` resets the region in place. It zeroes the pages
+    /// the guest uses on each run, keeping them mapped, and drops the
+    /// rest (see [`ScratchReset`]). If that fails, the whole region is
+    /// dropped with `MADV_DONTNEED` for lazy zeroing. On MSHV, whose
+    /// mappings must stay in sync with userspace, it is zeroed with
+    /// `fill(0)`.
     ///
     /// On Windows, zeroing via `fill(0)` is prohibitively expensive
     /// for large regions (e.g. 448 MiB scratch).  Instead, the
@@ -1495,7 +1500,10 @@ impl HostSharedMemory {
     // TODO: Find the break-even point between zero-in-place and
     // replace for each hypervisor and use a size-based heuristic
     // instead of a compile-time platform check.
-    pub(crate) fn zero_or_replace(&mut self) -> Result<Option<GuestSharedMemory>> {
+    pub(crate) fn zero_or_replace(
+        &mut self,
+        #[cfg_attr(not(all(kvm, not(miri))), allow(unused_variables))] state: &mut ScratchReset,
+    ) -> Result<Option<GuestSharedMemory>> {
         #[cfg(target_os = "windows")]
         {
             let new_mem = ExclusiveSharedMemory::new(self.mem_size())?;
@@ -1506,24 +1514,30 @@ impl HostSharedMemory {
         #[cfg(not(target_os = "windows"))]
         {
             self.with_exclusivity(|e| {
-                #[allow(unused_mut)]
-                let mut do_copy = true;
                 // TODO: Find a similar lazy zeroing approach that works on MSHV.
                 //       (See Note [Keeping mappings in sync between userspace and the guest])
-                #[cfg(all(feature = "kvm", not(any(feature = "mshv3"))))]
-                unsafe {
-                    let ret = libc::madvise(
-                        e.region.ptr() as *mut libc::c_void,
-                        e.region.size(),
-                        libc::MADV_DONTNEED,
-                    );
+                #[cfg(all(kvm, not(miri)))]
+                if matches!(
+                    crate::hypervisor::virtual_machine::get_available_hypervisor(),
+                    Some(crate::hypervisor::virtual_machine::HypervisorType::Kvm)
+                ) {
+                    if state.reset(e).is_ok() {
+                        return;
+                    }
+                    // SAFETY: the region is a private anonymous mapping,
+                    // held exclusively.
+                    let ret = unsafe {
+                        libc::madvise(
+                            e.base_ptr() as *mut libc::c_void,
+                            e.mem_size(),
+                            libc::MADV_DONTNEED,
+                        )
+                    };
                     if ret == 0 {
-                        do_copy = false;
+                        return;
                     }
                 }
-                if do_copy {
-                    e.as_mut_slice().fill(0);
-                }
+                e.as_mut_slice().fill(0);
             })?;
             Ok(None)
         }
