@@ -43,6 +43,11 @@ const SPAN_GAP_PAGES: usize = 256;
 /// a pagemap read and a drop per reset.
 const MAX_SPANS: usize = 16;
 
+/// The most pages the spans cover. A reset reads pagemap for all of
+/// them, so a guest that spreads a few pages across the region is
+/// dropped every reset (see [`Phase::TooBig`]).
+const MAX_SPAN_PAGES: usize = 8192;
+
 /// The most drops a scan makes inside its spans. A guest that scatters
 /// its pages past it is dropped every reset (see [`Phase::TooBig`]).
 const MAX_DROPS: usize = 64;
@@ -90,8 +95,8 @@ enum Phase {
         until_scan: u32,
         scans: u32,
     },
-    /// A run backed more than the limit, or scattered its pages past
-    /// [`MAX_DROPS`], or pagemap failed. Every reset drops everything,
+    /// A run backed more than the limit, scattered its pages past
+    /// [`MAX_DROPS`] or [`MAX_SPAN_PAGES`], or pagemap failed. Every reset drops everything,
     /// `left` more times, then learning starts again.
     TooBig { left: u32 },
 }
@@ -309,7 +314,10 @@ impl ScratchReset {
                 } else {
                     let baseline = baseline.max(scan.kept);
                     let spans = merge(&spans, &scan.spans);
-                    if left > 1 {
+                    if covered(&spans) > MAX_SPAN_PAGES {
+                        region.drop_pages(all)?;
+                        too_big()
+                    } else if left > 1 {
                         Phase::Learning {
                             left: left - 1,
                             baseline,
@@ -354,12 +362,18 @@ impl ScratchReset {
                     region.drop_pages(all)?;
                     learning()
                 } else if full {
-                    Phase::Steady {
-                        baseline,
-                        spans: merge(&scanned, &scan.spans),
-                        scanned: scan.spans,
-                        until_scan: RESETS_PER_SCAN,
-                        scans: scans + 1,
+                    let spans = merge(&scanned, &scan.spans);
+                    if covered(&spans) > MAX_SPAN_PAGES {
+                        region.drop_pages(all)?;
+                        too_big()
+                    } else {
+                        Phase::Steady {
+                            baseline,
+                            spans,
+                            scanned: scan.spans,
+                            until_scan: RESETS_PER_SCAN,
+                            scans: scans + 1,
+                        }
                     }
                 } else {
                     Phase::Steady {
@@ -464,6 +478,11 @@ fn learning() -> Phase {
         baseline: 0,
         spans: Vec::new(),
     }
+}
+
+/// The pages `spans` cover.
+fn covered(spans: &[Range<usize>]) -> usize {
+    spans.iter().map(|s| s.len()).sum()
 }
 
 /// The spans covering both `a` and `b` (each sorted), merged as a scan
@@ -804,6 +823,26 @@ mod tests {
             scatter(&mut mem);
             reset(&mut state, &mut mem);
             assert!(all_zero(&mut mem));
+        }
+        assert!(matches!(state.phase, Phase::TooBig { .. }));
+    }
+
+    /// A few pages spread across a large region make the spans cover
+    /// too much of it: every reset drops it all. Only the written pages
+    /// are read back, since reading the rest maps the zero page there,
+    /// which counts against the drops instead.
+    #[test]
+    fn spread_pages_are_dropped_wholesale() {
+        let mut mem = region(16384);
+        let mut state = ScratchReset::default();
+        for _ in 0..6 {
+            for p in (0..16384).step_by(400) {
+                write(&mut mem, p, 1);
+            }
+            reset(&mut state, &mut mem);
+            for p in (0..16384).step_by(400) {
+                assert_eq!(mem.as_mut_slice()[p * page() + 7], 0);
+            }
         }
         assert!(matches!(state.phase, Phase::TooBig { .. }));
     }
