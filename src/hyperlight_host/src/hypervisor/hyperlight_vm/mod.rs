@@ -7,6 +7,8 @@ mod x86_64;
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 
+mod dirty_log;
+
 #[cfg(all(test, not(gdb)))]
 pub(crate) mod test_support;
 
@@ -18,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use hyperlight_common::log_level::GuestLogFilter;
 use tracing_core::LevelFilter;
 
+use self::dirty_log::ScratchDirtyLog;
 use crate::HyperlightError;
 #[cfg(gdb)]
 use crate::hypervisor::gdb::DebuggableVm;
@@ -36,7 +39,7 @@ use crate::hypervisor::virtual_machine::{
 };
 use crate::hypervisor::{InterruptHandle, InterruptHandleImpl};
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags, MemoryRegionType};
-use crate::mem::mgr::{SandboxMemoryManager, SnapshotSharedMemory};
+use crate::mem::mgr::{SandboxMemoryManager, ScratchZeroed, SnapshotSharedMemory};
 use crate::mem::shared_mem::{GuestSharedMemory, HostSharedMemory, SharedMemory};
 use crate::metrics::{METRIC_ERRONEOUS_VCPU_KICKS, METRIC_GUEST_CANCELLATION};
 use crate::sandbox::host_funcs::FunctionRegistry;
@@ -378,6 +381,8 @@ pub(crate) struct HyperlightVm {
     // The current scratch region, used to keep it alive as long as it
     // is used & when unmapping
     pub(super) scratch_memory: Option<GuestSharedMemory>,
+    /// What the guest wrote to scratch since the last restore.
+    pub(super) scratch_dirty: ScratchDirtyLog,
 
     pub(super) mmap_regions: Vec<(u32, MemoryRegion)>, // Later mapped regions (slot number, region)
 
@@ -533,6 +538,21 @@ impl HyperlightVm {
         self.snapshot_memory = Some(snapshot);
 
         Ok(())
+    }
+
+    /// The scratch pages the guest wrote since the last restore, where
+    /// the hypervisor logs them. Called once per restore, before
+    /// scratch is reset. See [`ScratchDirtyLog`].
+    pub(crate) fn scratch_dirty_pages(&mut self) -> Option<&mut Vec<u64>> {
+        let size = self.scratch_memory.as_ref()?.mem_size();
+        let gpa = hyperlight_common::layout::scratch_base_gpa(size);
+        self.scratch_dirty.take(&mut *self.vm, gpa, size)
+    }
+
+    /// How the restore after
+    /// [`scratch_dirty_pages`](Self::scratch_dirty_pages) zeroed scratch.
+    pub(crate) fn scratch_zeroed(&mut self, zeroed: ScratchZeroed) {
+        self.scratch_dirty.zeroed(zeroed);
     }
 
     /// Update the scratch mapping to point to a new GuestSharedMemory

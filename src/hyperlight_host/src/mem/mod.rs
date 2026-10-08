@@ -24,8 +24,9 @@ pub(crate) mod scratch_reset;
 /// A wrapper around unsafe functionality to create and initialize
 /// a memory region for a guest running in a sandbox.
 pub mod shared_mem;
-/// Without KVM, scratch is reset by filling or replacing it: nothing to
-/// keep between resets.
+/// Without KVM, scratch is reset by zeroing what was written, filling or
+/// replacing it (see `HostSharedMemory::zero_written` and
+/// `zero_or_replace`): nothing to keep between resets.
 #[cfg(not(all(kvm, not(miri))))]
 pub(crate) mod scratch_reset {
     #[derive(Debug, Default)]

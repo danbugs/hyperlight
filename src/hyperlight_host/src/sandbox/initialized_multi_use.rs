@@ -417,13 +417,17 @@ impl MultiUseSandbox {
     }
 
     fn restore_memory_and_mappings(&mut self, snapshot: &Snapshot) -> Result<()> {
-        let (snapshot_mem, scratch_mem) = self.mem_mgr.restore_snapshot(snapshot)?;
-        if let Some(snapshot_mem) = snapshot_mem {
+        let guest_written = self.vm.scratch_dirty_pages();
+        let restored = self.mem_mgr.restore_snapshot(snapshot, guest_written)?;
+        if let Some(zeroed) = restored.scratch_zeroed {
+            self.vm.scratch_zeroed(zeroed);
+        }
+        if let Some(snapshot_mem) = restored.snapshot {
             self.vm
                 .update_snapshot_mapping(snapshot_mem)
                 .map_err(HyperlightVmError::UpdateRegion)?;
         }
-        if let Some(scratch_mem) = scratch_mem {
+        if let Some(scratch_mem) = restored.scratch {
             self.vm
                 .update_scratch_mapping(scratch_mem)
                 .map_err(HyperlightVmError::UpdateRegion)?;
@@ -1397,6 +1401,65 @@ mod tests {
                     format!("Hello World {}\n", i).to_string(),
                 )
                 .unwrap();
+        }
+    }
+
+    /// Restores that zero only the scratch pages written since the last
+    /// one leave nothing behind: while tracking starts, while the guest
+    /// writes much of scratch (which switches MSHV tracking off), and
+    /// when tracking starts again.
+    #[test]
+    fn restore_zeroes_every_scratch_page_written() {
+        // After a restore, scratch holds only what the host wrote: each
+        // I/O buffer's stack pointer at the bottom, the page tables
+        // after the buffers, and the bookkeeping page at the top. The
+        // buffers held the last run's calls and results.
+        fn assert_reset(sbox: &mut MultiUseSandbox, i: u64) {
+            const ZERO: [u8; 4096] = [0; 4096];
+            let layout = sbox.mem_mgr.layout;
+            let input = layout.get_input_data_buffer_scratch_host_offset();
+            let output = layout.get_output_data_buffer_scratch_host_offset();
+            let buffers = [
+                input + 8..input + layout.input_data_size(),
+                output + 8..output + layout.output_data_size(),
+            ];
+            let free = sbox.mem_mgr.scratch_pt_range().end
+                ..sbox.mem_mgr.scratch_mem.mem_size() - ZERO.len();
+            for range in buffers.into_iter().chain([free]) {
+                let left = sbox
+                    .mem_mgr
+                    .scratch_mem
+                    .with_contents(|scratch| {
+                        scratch[range.clone()]
+                            .chunks(ZERO.len())
+                            .position(|page| page != &ZERO[..page.len()])
+                    })
+                    .unwrap();
+                assert_eq!(left, None, "restore {i} left scratch in {range:#x?}");
+            }
+        }
+
+        const SCRATCH: usize = 4 << 20;
+        let mut sbox = SandboxBuilder::from_file(simple_guest_as_pathbuf())
+            .heap_size(8 << 20)
+            .scratch_size(SCRATCH)
+            .build()
+            .unwrap();
+        let snapshot = sbox.snapshot().unwrap();
+        for i in 0..300u64 {
+            // A few pages, with a stretch writing a quarter of scratch.
+            let len = if (100..110).contains(&i) {
+                SCRATCH as u64 / 4
+            } else {
+                4096 * (i % 5)
+            };
+            sbox.call::<()>("AllocAndWritePattern", len).unwrap();
+            sbox.restore(snapshot.clone()).unwrap();
+            assert_reset(&mut sbox, i);
+            let pattern: Vec<u8> = sbox.call("ReadPattern", ()).unwrap();
+            assert!(pattern.is_empty(), "restore {i} kept the pattern");
+            sbox.restore(snapshot.clone()).unwrap();
+            assert_reset(&mut sbox, i);
         }
     }
 

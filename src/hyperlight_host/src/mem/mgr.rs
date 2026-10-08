@@ -118,6 +118,26 @@ impl ReadonlySharedMemory {
     }
 }
 pub(crate) use unused_hack::SnapshotSharedMemory;
+/// What [`SandboxMemoryManager::restore_snapshot`] leaves the caller to
+/// map, and what it measured.
+pub(crate) struct RestoredMemory {
+    /// New snapshot memory to map in place of the old.
+    pub(crate) snapshot: Option<SnapshotSharedMemory<GuestSharedMemory>>,
+    /// New scratch memory to map in place of the old.
+    pub(crate) scratch: Option<GuestSharedMemory>,
+    /// How scratch was zeroed in place, and how long it took.
+    pub(crate) scratch_zeroed: Option<ScratchZeroed>,
+}
+
+/// How a restore zeroed scratch in place, and how long it took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScratchZeroed {
+    /// All of it, not knowing what was written.
+    All(std::time::Duration),
+    /// The pages written since the last restore.
+    Written(std::time::Duration),
+}
+
 /// A struct that is responsible for laying out and managing the memory
 /// for a given `Sandbox`.
 pub(crate) struct SandboxMemoryManager<S: SharedMemory> {
@@ -472,13 +492,15 @@ impl SandboxMemoryManager<HostSharedMemory> {
     }
 
     /// This function restores a memory snapshot from a given snapshot.
+    ///
+    /// `guest_written` is the scratch pages the guest wrote since the
+    /// last restore, one bit per 4 KiB page, when the hypervisor logs
+    /// them. Only those, and what the host wrote, are zeroed then.
     pub(crate) fn restore_snapshot(
         &mut self,
         snapshot: &Snapshot,
-    ) -> Result<(
-        Option<SnapshotSharedMemory<GuestSharedMemory>>,
-        Option<GuestSharedMemory>,
-    )> {
+        guest_written: Option<&mut Vec<u64>>,
+    ) -> Result<RestoredMemory> {
         let gsnapshot = if *snapshot.memory() == self.shared_mem {
             // If the snapshot memory is already the correct memory,
             // which is readonly, don't bother with restoring it,
@@ -495,10 +517,29 @@ impl SandboxMemoryManager<HostSharedMemory> {
             Some(gsnapshot)
         };
         let new_scratch_size = snapshot.layout().get_scratch_size();
+        let mut scratch_zeroed = None;
         let gscratch = if new_scratch_size == self.scratch_mem.mem_size() {
-            // zero_or_replace picks the fastest zeroing strategy for
-            // the current platform (see SharedMemory::zero_or_replace).
-            self.scratch_mem.zero_or_replace(&mut self.scratch_reset)?
+            match guest_written {
+                Some(written) => {
+                    // The page tables are copied in with exclusive
+                    // access, which the host-write log does not see.
+                    let took = self
+                        .scratch_mem
+                        .zero_written(written, self.scratch_pt_range())?;
+                    scratch_zeroed = Some(ScratchZeroed::Written(took));
+                    None
+                }
+                None => {
+                    let start = std::time::Instant::now();
+                    // zero_or_replace picks the fastest zeroing strategy for
+                    // the current platform (see SharedMemory::zero_or_replace).
+                    let gscratch = self.scratch_mem.zero_or_replace(&mut self.scratch_reset)?;
+                    if gscratch.is_none() {
+                        scratch_zeroed = Some(ScratchZeroed::All(start.elapsed()));
+                    }
+                    gscratch
+                }
+            }
         } else {
             let new_scratch_mem = ExclusiveSharedMemory::new(new_scratch_size)?;
             let (hscratch, gscratch) = new_scratch_mem.build();
@@ -522,7 +563,11 @@ impl SandboxMemoryManager<HostSharedMemory> {
         self.original_entrypoint = snapshot.original_entrypoint();
 
         self.update_scratch_bookkeeping()?;
-        Ok((gsnapshot, gscratch))
+        Ok(RestoredMemory {
+            snapshot: gsnapshot,
+            scratch: gscratch,
+            scratch_zeroed,
+        })
     }
 
     #[inline]
@@ -541,6 +586,13 @@ impl SandboxMemoryManager<HostSharedMemory> {
             hyperlight_common::layout::SCRATCH_TOP_LIBC_RNG_SEED_OFFSET,
             (1_u64 << 32) | u64::from(seed),
         )
+    }
+
+    /// Where [`update_scratch_bookkeeping`](Self::update_scratch_bookkeeping)
+    /// copies the snapshot's page tables into scratch.
+    pub(crate) fn scratch_pt_range(&self) -> std::ops::Range<usize> {
+        let start = self.layout.get_pt_base_scratch_offset();
+        start..start + self.layout.get_pt_size().next_multiple_of(page_size::get())
     }
 
     fn update_scratch_bookkeeping(&mut self) -> Result<()> {
@@ -586,9 +638,9 @@ impl SandboxMemoryManager<HostSharedMemory> {
         // overlapping with `map_file_cow` regions installed
         // immediately after the snapshot in the guest PA space.
         let snapshot_pt_end = self.shared_mem.mem_size();
+        #[cfg(unshared_snapshot_mem)]
         let snapshot_pt_size = self.layout.get_pt_size();
-        let snapshot_pt_start =
-            snapshot_pt_end - snapshot_pt_size.next_multiple_of(page_size::get());
+        let snapshot_pt_start = snapshot_pt_end - self.scratch_pt_range().len();
         self.scratch_mem.with_exclusivity(|scratch| {
             #[cfg(not(unshared_snapshot_mem))]
             let bytes = &self.shared_mem.as_slice()[snapshot_pt_start..snapshot_pt_end];
