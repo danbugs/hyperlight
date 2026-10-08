@@ -51,6 +51,11 @@ const MAX_DROPS: usize = 64;
 /// set is dropped for before it is learned again.
 const RESETS_PER_SCAN: u32 = 64;
 
+/// Whole-region scans between relearning. Kept pages stay backed, so
+/// pages a shrunk working set left behind are only given back by
+/// dropping everything and learning again.
+const RELEARN_SCANS: u32 = 8;
+
 /// Pagemap entries read at a time.
 const CHUNK_PAGES: usize = 512;
 
@@ -76,12 +81,14 @@ enum Phase {
     /// Keeping the pages a run backs inside `spans`, and dropping the
     /// rest. A whole-region scan runs when `until_scan` is 0, and its
     /// spans with the last one's (`scanned`) become `spans`, so spans a
-    /// working set left behind go.
+    /// working set left behind go. After [`RELEARN_SCANS`] of them
+    /// (`scans`), the region is dropped and learned again.
     Steady {
         baseline: usize,
         spans: Vec<Range<usize>>,
         scanned: Vec<Range<usize>>,
         until_scan: u32,
+        scans: u32,
     },
     /// A run backed more than the limit, or scattered its pages past
     /// [`MAX_DROPS`], or pagemap failed. Every reset drops everything,
@@ -314,15 +321,23 @@ impl ScratchReset {
                             scanned: spans.clone(),
                             spans,
                             until_scan: RESETS_PER_SCAN,
+                            scans: 0,
                         }
                     }
                 }
+            }
+            Phase::Steady {
+                scans, until_scan, ..
+            } if until_scan == 0 && scans + 1 >= RELEARN_SCANS => {
+                region.drop_pages(all)?;
+                learning()
             }
             Phase::Steady {
                 baseline,
                 spans,
                 scanned,
                 until_scan,
+                scans,
             } => {
                 let full = until_scan == 0;
                 let scan = if full {
@@ -344,6 +359,7 @@ impl ScratchReset {
                         spans: merge(&scanned, &scan.spans),
                         scanned: scan.spans,
                         until_scan: RESETS_PER_SCAN,
+                        scans: scans + 1,
                     }
                 } else {
                     Phase::Steady {
@@ -351,6 +367,7 @@ impl ScratchReset {
                         spans,
                         scanned,
                         until_scan: until_scan - 1,
+                        scans,
                     }
                 }
             }
@@ -591,6 +608,28 @@ mod tests {
             reset(&mut state, &mut mem);
         }
         assert!((32..96).all(|p| kept(entry(&mem, p))));
+        assert!(all_zero(&mut mem));
+    }
+
+    /// Pages a working set used and no longer uses are given back.
+    #[test]
+    fn a_shrunk_working_set_gives_pages_back() {
+        let mut mem = region(2048);
+        let mut state = ScratchReset::default();
+        for _ in 0..6 {
+            for p in 0..512 {
+                write(&mut mem, p, 1);
+            }
+            reset(&mut state, &mut mem);
+        }
+        assert!(kept(entry(&mem, 300)));
+        let resets = (RESETS_PER_SCAN + 1) * RELEARN_SCANS + LEARN_RESETS + 2;
+        for _ in 0..resets {
+            write(&mut mem, 0, 1);
+            reset(&mut state, &mut mem);
+        }
+        assert!(kept(entry(&mem, 0)));
+        assert!(!kept(entry(&mem, 300)));
         assert!(all_zero(&mut mem));
     }
 
