@@ -659,9 +659,14 @@ mod tests {
     }
 
     /// A forked child resets its own pages, not the ones its parent's
-    /// pagemap shows: page 15, in a learned span and empty in the parent,
-    /// is one the child wrote.
+    /// pagemap shows. After the fork the parent writes pages 10 and 20
+    /// again, so its pagemap shows them as its own and page 15, which the
+    /// child wrote, as empty: a reset reading it would leave page 15.
+    /// Ignored: it forks, so `forked_child_shim` runs it alone in a
+    /// process of its own, away from the pages and locks of tests running
+    /// in parallel.
     #[test]
+    #[ignore]
     fn a_forked_child_resets_its_own_pages() {
         let mut mem = region(512);
         let mut state = ScratchReset::default();
@@ -671,12 +676,19 @@ mod tests {
             reset(&mut state, &mut mem);
         }
         assert!(matches!(&state.phase, Phase::Steady { spans, .. } if spans[..] == [10..21]));
-        // SAFETY: the child writes its copy of `mem`, resets it (opening
-        // pagemap, which allocates), and exits without unwinding. The
-        // allocator is fork safe, and the child takes no other lock.
+        let mut fds = [0; 2];
+        // SAFETY: two valid fds for the pipe.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: the process runs this test alone (`forked_child_shim`).
+        // The child waits for the parent, writes its copy of `mem`, resets
+        // it (opening pagemap, which allocates), and exits without
+        // unwinding.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0);
         if pid == 0 {
+            let mut byte = 0u8;
+            // SAFETY: reads one byte into `byte` from the pipe.
+            unsafe { libc::read(fds[0], (&mut byte as *mut u8).cast(), 1) };
             let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 write(&mut mem, 15, 0x5a);
                 state.reset(&mut mem).is_ok() && all_zero(&mut mem)
@@ -684,10 +696,36 @@ mod tests {
             // SAFETY: ends the child.
             unsafe { libc::_exit(if matches!(ok, Ok(true)) { 0 } else { 1 }) };
         }
+        write(&mut mem, 10, 2);
+        write(&mut mem, 20, 2);
+        assert!(kept(entry(&mem, 10)) && !held(entry(&mem, 15)));
+        // SAFETY: writes one byte to the pipe, then waits for the child.
         let mut status = 0;
-        // SAFETY: waits for the child above.
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe {
+            libc::write(fds[1], [1u8].as_ptr().cast(), 1);
+            libc::waitpid(pid, &mut status, 0);
+        }
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    }
+
+    #[test]
+    fn forked_child_shim() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "--test-threads=1",
+                "mem::scratch_reset::tests::a_forked_child_resets_its_own_pages",
+            ])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// Without pagemap, every reset drops everything, and says so once.
