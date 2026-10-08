@@ -1464,6 +1464,15 @@ impl HostSharedMemory {
                     }
                 }
             }
+            // The oracle: after a reset, nothing may be left.
+            if std::env::var_os("HL_DIRTY_VERIFY").is_some() {
+                if let Some(at) = mem.iter().position(|&b| b != 0) {
+                    panic!(
+                        "dirty reset missed scratch offset {at:#x} of {size:#x} (page {})",
+                        at / DIRTY_PAGE
+                    );
+                }
+            }
         })
     }
 

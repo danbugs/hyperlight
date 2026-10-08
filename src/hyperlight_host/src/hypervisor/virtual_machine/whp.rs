@@ -266,6 +266,9 @@ pub(crate) struct WhpVm {
     /// Handle to the background timer (if started).
     #[cfg(feature = "hw-interrupts")]
     timer: Option<TimerThread>,
+    /// EXPERIMENT: scratch is mapped with dirty tracking, and has been
+    /// read once since.
+    dirty_primed: AtomicBool,
 }
 
 // Safety: `WhpVm` is !Send because it holds `Option<SurrogateProcess>` which
@@ -334,6 +337,7 @@ impl WhpVm {
             _no_surrogate_guard: no_surrogate_guard,
             #[cfg(feature = "hw-interrupts")]
             timer: None,
+            dirty_primed: AtomicBool::new(false),
         })
     }
 
@@ -377,6 +381,26 @@ impl WhpVm {
 }
 
 impl VirtualMachine for WhpVm {
+    fn scratch_dirty_bitmap(&self, gpa: u64, size: usize) -> Option<Vec<u64>> {
+        let mut bitmap = vec![0u64; (size >> 12).div_ceil(64)];
+        let bytes = u32::try_from(bitmap.len() * 8).ok()?;
+        unsafe {
+            WHvQueryGpaRangeDirtyBitmap(
+                self.partition,
+                gpa,
+                size as u64,
+                Some(bitmap.as_mut_ptr()),
+                bytes,
+            )
+        }
+        .ok()?;
+        // The first read after mapping covers the host's own setup
+        // writes too; let the caller fill once.
+        self.dirty_primed
+            .swap(true, Ordering::Relaxed)
+            .then_some(bitmap)
+    }
+
     unsafe fn map_memory(
         &mut self,
         (_slot, region): (u32, &MemoryRegion),
@@ -397,6 +421,15 @@ impl VirtualMachine for WhpVm {
             .collect::<std::result::Result<Vec<WHV_MAP_GPA_RANGE_FLAGS>, MapMemoryError>>()?
             .iter()
             .fold(WHvMapGpaRangeFlagNone, |acc, flag| acc | *flag);
+        let flags = if region.region_type == MemoryRegionType::Scratch
+            && crate::mem::shared_mem::forced_strategy()
+                == Some(crate::mem::shared_mem::ForcedStrategy::Dirty)
+        {
+            self.dirty_primed.store(false, Ordering::Relaxed);
+            flags | WHvMapGpaRangeFlagTrackDirtyPages
+        } else {
+            flags
+        };
 
         match &mut self.surrogate_process {
             None => {
