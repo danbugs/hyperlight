@@ -29,7 +29,7 @@ use super::shared_mem::{ExclusiveSharedMemory, SharedMemory};
 /// The most memory a reset keeps. A run that backs more is dropped every
 /// reset, since zeroing it costs more than refaulting what the next run
 /// touches.
-const KEEP_RESIDENT_MAX: usize = 16 << 20;
+const KEEP_RESIDENT_MAX: usize = super::RESIDENT_SCRATCH_MAX;
 
 /// Full scans that learn how much a run backs and where, keeping the
 /// most and all of the spans. More than one, so a reset after no run
