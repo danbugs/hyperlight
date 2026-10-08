@@ -442,6 +442,13 @@ pub(crate) trait VirtualMachine: Debug + Send {
         region: (u32, &MemoryRegion),
     ) -> std::result::Result<(), MapMemoryError>;
 
+    /// EXPERIMENT: the guest pages dirtied in [gpa, gpa+size) since the
+    /// last call, one bit per page, cleared as read. None where
+    /// unsupported, or when tracking has only just started.
+    fn scratch_dirty_bitmap(&self, _gpa: u64, _size: usize) -> Option<Vec<u64>> {
+        None
+    }
+
     /// Unmap memory region from this VM that has previously been mapped using `map_memory`.
     fn unmap_memory(
         &mut self,

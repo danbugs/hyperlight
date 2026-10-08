@@ -535,6 +535,14 @@ impl HyperlightVm {
         Ok(())
     }
 
+    /// EXPERIMENT: see VirtualMachine::scratch_dirty_bitmap.
+    pub(crate) fn scratch_dirty_bitmap(&self, scratch_size: usize) -> Option<Vec<u64>> {
+        self.vm.scratch_dirty_bitmap(
+            hyperlight_common::layout::scratch_base_gpa(scratch_size),
+            scratch_size,
+        )
+    }
+
     /// Update the scratch mapping to point to a new GuestSharedMemory
     pub(crate) fn update_scratch_mapping(
         &mut self,

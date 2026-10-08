@@ -1442,10 +1442,48 @@ impl HostSharedMemory {
     // TODO: Find the break-even point between zero-in-place and
     // replace for each hypervisor and use a size-based heuristic
     // instead of a compile-time platform check.
+    /// EXPERIMENT: zero only what changed since the last reset: the pages
+    /// the guest dirtied (`bitmap`, one bit per page, bits past the end
+    /// ignored), the host-written prefix, and the top bookkeeping page.
+    pub(crate) fn zero_dirty(&mut self, bitmap: &[u64], prefix: usize) -> Result<()> {
+        // Dirty bitmaps track 4 KiB guest pages.
+        const DIRTY_PAGE: usize = 4096;
+        self.with_exclusivity(|e| {
+            let size = e.mem_size();
+            let pages = size / DIRTY_PAGE;
+            let mem = e.as_mut_slice();
+            mem[..prefix.min(size)].fill(0);
+            mem[size - DIRTY_PAGE..].fill(0);
+            for (w, &word) in bitmap.iter().enumerate() {
+                let mut word = word;
+                while word != 0 {
+                    let page = w * 64 + word.trailing_zeros() as usize;
+                    word &= word - 1;
+                    if page < pages {
+                        mem[page * DIRTY_PAGE..][..DIRTY_PAGE].fill(0);
+                    }
+                }
+            }
+        })
+    }
+
     pub(crate) fn zero_or_replace(
         &mut self,
         #[cfg_attr(not(all(kvm, not(miri))), allow(unused_variables))] state: &mut ScratchReset,
     ) -> Result<Option<GuestSharedMemory>> {
+        match forced_strategy() {
+            Some(ForcedStrategy::Fill) | Some(ForcedStrategy::Dirty) => {
+                self.with_exclusivity(|e| e.as_mut_slice().fill(0))?;
+                return Ok(None);
+            }
+            Some(ForcedStrategy::Replace) => {
+                let new_mem = ExclusiveSharedMemory::new(self.mem_size())?;
+                let (hscratch, gscratch) = new_mem.build();
+                *self = hscratch;
+                return Ok(Some(gscratch));
+            }
+            None => {}
+        }
         #[cfg(target_os = "windows")]
         {
             let new_mem = ExclusiveSharedMemory::new(self.mem_size())?;
@@ -1663,8 +1701,8 @@ impl ReadonlySharedMemory {
         let file_prot = PROT_READ | PROT_WRITE;
         #[cfg(not(mshv3))]
         let file_prot = PROT_READ;
-        // SAFETY: `total_size = len + 2 * PAGE_SIZE_USIZE`, so
-        // `base + PAGE_SIZE_USIZE` is in-bounds of the reservation.
+        // SAFETY: `total_size = len + 2 * DIRTY_PAGE`, so
+        // `base + DIRTY_PAGE` is in-bounds of the reservation.
         let usable_ptr = unsafe { (base as *mut u8).add(page_size::get()) };
         // SAFETY: `usable_ptr..usable_ptr + len` lies entirely within
         // the reservation owned by `reservation`. `MAP_FIXED`
@@ -2702,4 +2740,24 @@ mod tests {
             }
         }
     }
+}
+
+/// EXPERIMENT: a scratch reset strategy forced with `HL_SCRATCH_STRATEGY`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForcedStrategy {
+    Fill,
+    Replace,
+    Dirty,
+}
+
+pub(crate) fn forced_strategy() -> Option<ForcedStrategy> {
+    static S: std::sync::OnceLock<Option<ForcedStrategy>> = std::sync::OnceLock::new();
+    *S.get_or_init(
+        || match std::env::var("HL_SCRATCH_STRATEGY").ok()?.as_str() {
+            "fill" => Some(ForcedStrategy::Fill),
+            "replace" => Some(ForcedStrategy::Replace),
+            "dirty" => Some(ForcedStrategy::Dirty),
+            _ => None,
+        },
+    )
 }

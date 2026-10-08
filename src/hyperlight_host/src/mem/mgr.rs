@@ -677,9 +677,23 @@ impl SandboxMemoryManager<HostSharedMemory> {
     }
 
     /// Restore base memory after the caller checks snapshot compatibility.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn restore_snapshot(
         &mut self,
         snapshot: &Snapshot,
+    ) -> Result<(
+        Option<SnapshotSharedMemory<GuestSharedMemory>>,
+        Option<GuestSharedMemory>,
+    )> {
+        self.restore_snapshot_with(snapshot, None)
+    }
+
+    /// EXPERIMENT: `dirty` is the guest dirty bitmap of scratch since the
+    /// last reset, when the VM tracks it.
+    pub(crate) fn restore_snapshot_with(
+        &mut self,
+        snapshot: &Snapshot,
+        dirty: Option<Vec<u64>>,
     ) -> Result<(
         Option<SnapshotSharedMemory<GuestSharedMemory>>,
         Option<GuestSharedMemory>,
@@ -714,7 +728,17 @@ impl SandboxMemoryManager<HostSharedMemory> {
         let gscratch = if new_scratch_size == self.scratch_mem.mem_size() {
             // zero_or_replace picks the fastest zeroing strategy for
             // the current platform (see SharedMemory::zero_or_replace).
-            self.scratch_mem.zero_or_replace(&mut self.scratch_reset)?
+            match dirty {
+                Some(bitmap) => {
+                    // The host writes the transport arena and the page
+                    // tables after it; the guest dirty log misses those.
+                    let prefix = self.layout.get_pt_base_scratch_offset()
+                        + self.layout.get_pt_size().next_multiple_of(page_size::get());
+                    self.scratch_mem.zero_dirty(&bitmap, prefix)?;
+                    None
+                }
+                None => self.scratch_mem.zero_or_replace(&mut self.scratch_reset)?,
+            }
         } else {
             let new_scratch_mem = ExclusiveSharedMemory::new(new_scratch_size)?;
             let (hscratch, gscratch) = new_scratch_mem.build();

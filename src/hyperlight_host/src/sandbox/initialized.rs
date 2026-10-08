@@ -487,7 +487,15 @@ impl Sandbox {
     }
 
     fn restore_memory_and_mappings(&mut self, snapshot: &Snapshot) -> Result<()> {
-        let (snapshot_mem, scratch_mem) = self.mem_mgr.restore_snapshot(snapshot)?;
+        let dirty = if crate::mem::shared_mem::forced_strategy()
+            == Some(crate::mem::shared_mem::ForcedStrategy::Dirty)
+        {
+            self.vm
+                .scratch_dirty_bitmap(self.mem_mgr.scratch_mem.mem_size())
+        } else {
+            None
+        };
+        let (snapshot_mem, scratch_mem) = self.mem_mgr.restore_snapshot_with(snapshot, dirty)?;
         if let Some(snapshot_mem) = snapshot_mem {
             self.vm
                 .update_snapshot_mapping(snapshot_mem)

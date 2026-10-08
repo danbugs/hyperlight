@@ -222,6 +222,20 @@ impl MshvVm {
 }
 
 impl VirtualMachine for MshvVm {
+    fn scratch_dirty_bitmap(&self, gpa: u64, size: usize) -> Option<Vec<u64>> {
+        let op = mshv_bindings::MSHV_GPAP_ACCESS_OP_CLEAR as u8;
+        match self.vm_fd.get_dirty_log(gpa >> 12, size, op) {
+            Ok(bitmap) => Some(bitmap),
+            // Not tracking yet. The first read reports every page dirty
+            // (#689), so read once to clear, and let the caller fill.
+            Err(_) => {
+                self.vm_fd.enable_dirty_page_tracking().ok()?;
+                let _ = self.vm_fd.get_dirty_log(gpa >> 12, size, op);
+                None
+            }
+        }
+    }
+
     unsafe fn map_memory(
         &mut self,
         (_slot, region): (u32, &MemoryRegion),
