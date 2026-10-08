@@ -1483,57 +1483,58 @@ impl HostSharedMemory {
     /// mappings must stay in sync with userspace, it is zeroed with
     /// `fill(0)`.
     ///
-    /// On Windows, zeroing via `fill(0)` is prohibitively expensive
-    /// for large regions (e.g. 448 MiB scratch).  Instead, the
-    /// mapping is replaced with a fresh demand-zero allocation.
-    /// Returns `Some(GuestSharedMemory)` when the mapping was
-    /// replaced (the caller must update the VM mapping), or `None`
-    /// when zeroed in place.
+    /// On Windows, scratch up to [`RESIDENT_SCRATCH_MAX`] is zeroed with
+    /// `fill(0)`. Larger scratch is replaced with a fresh demand-zero
+    /// allocation, since `fill(0)` takes long and makes all of it
+    /// resident (e.g. 448 MiB scratch). Returns `Some(GuestSharedMemory)`
+    /// when the mapping was replaced (the caller must update the VM
+    /// mapping), or `None` when zeroed in place.
+    ///
+    /// [`RESIDENT_SCRATCH_MAX`]: super::RESIDENT_SCRATCH_MAX
     pub(crate) fn zero_or_replace(
         &mut self,
         #[cfg_attr(not(all(kvm, not(miri))), allow(unused_variables))] state: &mut ScratchReset,
     ) -> Result<Option<GuestSharedMemory>> {
+        // Zeroing in place makes the whole region resident; above the cap,
+        // Windows maps fresh memory instead (#1765).
         #[cfg(target_os = "windows")]
-        {
+        if self.mem_size() > super::RESIDENT_SCRATCH_MAX {
             let new_mem = ExclusiveSharedMemory::new(self.mem_size())?;
             let (hscratch, gscratch) = new_mem.build();
             *self = hscratch;
-            Ok(Some(gscratch))
+            return Ok(Some(gscratch));
         }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let host_writes = self.host_writes.clone();
-            self.with_exclusivity(|e| {
-                // Nothing written before this reset is left to zero. Under
-                // the lock, so no host write is noted before it ends.
-                host_writes.clear();
-                // TODO: Find a similar lazy zeroing approach that works on MSHV.
-                //       (See Note [Keeping mappings in sync between userspace and the guest])
-                #[cfg(all(kvm, not(miri)))]
-                if matches!(
-                    crate::hypervisor::virtual_machine::get_available_hypervisor(),
-                    Some(crate::hypervisor::virtual_machine::HypervisorType::Kvm)
-                ) {
-                    if state.reset(e).is_ok() {
-                        return;
-                    }
-                    // SAFETY: the region is a private anonymous mapping,
-                    // held exclusively.
-                    let ret = unsafe {
-                        libc::madvise(
-                            e.base_ptr() as *mut libc::c_void,
-                            e.mem_size(),
-                            libc::MADV_DONTNEED,
-                        )
-                    };
-                    if ret == 0 {
-                        return;
-                    }
+        let host_writes = self.host_writes.clone();
+        self.with_exclusivity(|e| {
+            // Nothing written before this reset is left to zero. Under the
+            // lock, so no host write is noted before it ends.
+            host_writes.clear();
+            // TODO: Find a similar lazy zeroing approach that works on MSHV.
+            //       (See Note [Keeping mappings in sync between userspace and the guest])
+            #[cfg(all(kvm, not(miri)))]
+            if matches!(
+                crate::hypervisor::virtual_machine::get_available_hypervisor(),
+                Some(crate::hypervisor::virtual_machine::HypervisorType::Kvm)
+            ) {
+                if state.reset(e).is_ok() {
+                    return;
                 }
-                e.as_mut_slice().fill(0);
-            })?;
-            Ok(None)
-        }
+                // SAFETY: the region is a private anonymous mapping,
+                // held exclusively.
+                let ret = unsafe {
+                    libc::madvise(
+                        e.base_ptr() as *mut libc::c_void,
+                        e.mem_size(),
+                        libc::MADV_DONTNEED,
+                    )
+                };
+                if ret == 0 {
+                    return;
+                }
+            }
+            e.as_mut_slice().fill(0);
+        })?;
+        Ok(None)
     }
 }
 
@@ -1596,7 +1597,6 @@ impl HostWrites {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
     fn clear(&self) {
         for word in self.words() {
             word.store(0, Ordering::Relaxed);
@@ -1750,9 +1750,26 @@ mod zero_written_tests {
         }
     }
 
-    /// Windows replaces the mapping instead, with a new log.
+    /// Without a dirty log, Windows zeroes small scratch in place and
+    /// replaces large scratch.
     #[test]
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "windows")]
+    fn windows_replaces_only_large_scratch() {
+        use crate::mem::RESIDENT_SCRATCH_MAX;
+        let mut state = crate::mem::scratch_reset::ScratchReset::default();
+        let mut small = scratch(RESIDENT_SCRATCH_MAX / PAGE);
+        guest_write(&mut small, 3, 1);
+        small.write::<u8>(5 * PAGE, 1).unwrap();
+        assert!(small.zero_or_replace(&mut state).unwrap().is_none());
+        assert!(nonzero_pages(&mut small).is_empty());
+        let mut bitmap = vec![0; RESIDENT_SCRATCH_MAX / PAGE / 64];
+        small.host_writes.take_into(&mut bitmap);
+        assert!(bitmap.iter().all(|&w| w == 0));
+        let mut large = scratch(RESIDENT_SCRATCH_MAX / PAGE + 1);
+        assert!(large.zero_or_replace(&mut state).unwrap().is_some());
+    }
+
+    #[test]
     fn host_writes_are_cleared_by_a_full_reset() {
         let mut mem = scratch(16);
         mem.write::<u8>(3 * PAGE, 1).unwrap();

@@ -21,6 +21,11 @@ pub(super) mod ptr_addr_space;
 pub mod ptr_offset;
 #[cfg(all(kvm, not(miri)))]
 pub(crate) mod scratch_reset;
+/// The most scratch a reset that cannot tell what was written keeps
+/// resident: what the KVM reset keeps of a run's pages, and the largest
+/// scratch Windows zeroes in place rather than replaces.
+#[cfg_attr(not(any(all(kvm, not(miri)), target_os = "windows")), allow(dead_code))]
+pub(crate) const RESIDENT_SCRATCH_MAX: usize = 16 << 20;
 /// A wrapper around unsafe functionality to create and initialize
 /// a memory region for a guest running in a sandbox.
 pub mod shared_mem;
