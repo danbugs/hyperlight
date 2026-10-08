@@ -31,7 +31,8 @@ pub(crate) const RESIDENT_SCRATCH_MAX: usize = 16 << 20;
 /// (fill, replace, dontneed, scan, resident, dirty).
 pub(crate) fn forced() -> Option<&'static str> {
     static F: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    F.get_or_init(|| std::env::var("HL_RESET").ok()).as_deref()
+    F.get_or_init(|| std::env::var("HL_RESET").ok().filter(|v| v != "default"))
+        .as_deref()
 }
 
 /// EXPERIMENT: HL_KEEP_MB overrides the KVM keep cap.
