@@ -457,6 +457,8 @@ impl WhpVm {
     }
 }
 
+impl crate::hypervisor::virtual_machine::DirtyLog for WhpVm {}
+
 impl VirtualMachine for WhpVm {
     unsafe fn map_memory(
         &mut self,
