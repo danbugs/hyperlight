@@ -59,6 +59,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 * On KVM, restore resets scratch in place. The pages a guest uses on each run
   are zeroed and stay mapped, so its next run takes no faults on them. Up to
   16 MiB of scratch per sandbox stays resident between runs.
+* On WHP and MSHV on x86_64, restore zeroes only the scratch pages written since
+  the last restore, from the hypervisor's dirty-page log and a log of host
+  writes. WHP no longer replaces the scratch mapping on each restore, so the
+  pages a guest writes stay committed between restores. MSHV stops tracking
+  writes while tracking costs more than zeroing all of scratch, as when scratch
+  is small or the guest writes most of it, and retries later.
 
 ### Removed
 * `RunPool` and the run-specific `AllocError::InvalidAlign` variant.
