@@ -26,6 +26,21 @@ pub(crate) mod scratch_reset;
 /// scratch Windows zeroes in place rather than replaces.
 #[cfg_attr(not(any(all(kvm, not(miri)), target_os = "windows")), allow(dead_code))]
 pub(crate) const RESIDENT_SCRATCH_MAX: usize = 16 << 20;
+
+/// EXPERIMENT: force a scratch reset strategy with HL_RESET
+/// (fill, replace, dontneed, scan, resident, dirty).
+pub(crate) fn forced() -> Option<&'static str> {
+    static F: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    F.get_or_init(|| std::env::var("HL_RESET").ok()).as_deref()
+}
+
+/// EXPERIMENT: HL_KEEP_MB overrides the KVM keep cap.
+pub(crate) fn keep_max() -> usize {
+    std::env::var("HL_KEEP_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(RESIDENT_SCRATCH_MAX, |mb| mb << 20)
+}
 /// A wrapper around unsafe functionality to create and initialize
 /// a memory region for a guest running in a sandbox.
 pub mod shared_mem;

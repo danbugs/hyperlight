@@ -122,7 +122,7 @@ impl Default for ScratchReset {
         Self {
             region: (0, 0),
             phase: Phase::Fresh,
-            limit: KEEP_RESIDENT_MAX,
+            limit: super::keep_max(),
             pagemap: None,
             warned: false,
             #[cfg(test)]
@@ -268,6 +268,19 @@ impl ScratchReset {
         if self.region != key {
             self.region = key;
             self.phase = Phase::Fresh;
+        }
+        if super::forced() == Some("scan") {
+            // EXPERIMENT: no learning, scan everything every reset.
+            if matches!(self.phase, Phase::Fresh) {
+                region.hint_small_pages();
+                self.phase = Phase::TooBig { left: u32::MAX };
+            }
+            let all = 0..region.pages;
+            let scan = self.scan(&mut region, std::slice::from_ref(&all))?;
+            if scan.over(self.limit) {
+                region.drop_pages(all)?;
+            }
+            return Ok(());
         }
         let phase = std::mem::replace(&mut self.phase, Phase::Fresh);
         match self.step(&mut region, phase) {

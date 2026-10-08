@@ -112,6 +112,10 @@ impl ScratchDirtyLog {
         gpa: u64,
         size: usize,
     ) -> Option<&mut Vec<u64>> {
+        match crate::mem::forced() {
+            Some("dirty") | None => {}
+            Some(_) => return None,
+        }
         let result = match vm.dirty_tracking() {
             DirtyTracking::None => return None,
             _ if self.state == State::Failed => return None,
@@ -167,6 +171,16 @@ impl ScratchDirtyLog {
             self.range = (gpa, size);
             self.zero_all = None;
             self.zero_written = Duration::ZERO;
+        }
+        if crate::mem::forced() == Some("dirty") {
+            // EXPERIMENT: track from the first restore, never stop.
+            if let State::Off { .. } = self.state {
+                self.state = State::Off { left: 0 };
+            }
+            if let State::On { .. } = self.state {
+                vm.read_dirty_log(gpa, size, &mut self.bitmap)?;
+                return Ok(true);
+            }
         }
         match self.state {
             State::Failed => Ok(false),

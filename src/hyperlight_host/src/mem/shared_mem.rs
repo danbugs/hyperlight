@@ -1495,6 +1495,39 @@ impl HostSharedMemory {
         &mut self,
         #[cfg_attr(not(all(kvm, not(miri))), allow(unused_variables))] state: &mut ScratchReset,
     ) -> Result<Option<GuestSharedMemory>> {
+        match super::forced() {
+            Some("fill") => {
+                let host_writes = self.host_writes.clone();
+                self.with_exclusivity(|e| {
+                    host_writes.clear();
+                    e.as_mut_slice().fill(0);
+                })?;
+                return Ok(None);
+            }
+            Some("replace") => {
+                let new_mem = ExclusiveSharedMemory::new(self.mem_size())?;
+                let (hscratch, gscratch) = new_mem.build();
+                *self = hscratch;
+                return Ok(Some(gscratch));
+            }
+            #[cfg(target_os = "linux")]
+            Some("dontneed") => {
+                let host_writes = self.host_writes.clone();
+                self.with_exclusivity(|e| {
+                    host_writes.clear();
+                    // SAFETY: private anonymous mapping, held exclusively.
+                    unsafe {
+                        libc::madvise(
+                            e.base_ptr() as *mut libc::c_void,
+                            e.mem_size(),
+                            libc::MADV_DONTNEED,
+                        )
+                    };
+                })?;
+                return Ok(None);
+            }
+            _ => {}
+        }
         // Zeroing in place makes the whole region resident; above the cap,
         // Windows maps fresh memory instead (#1765).
         #[cfg(target_os = "windows")]
