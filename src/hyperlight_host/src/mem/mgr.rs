@@ -118,26 +118,6 @@ impl ReadonlySharedMemory {
     }
 }
 pub(crate) use unused_hack::SnapshotSharedMemory;
-/// What [`SandboxMemoryManager::restore_snapshot`] leaves the caller to
-/// map, and what it measured.
-pub(crate) struct RestoredMemory {
-    /// New snapshot memory to map in place of the old.
-    pub(crate) snapshot: Option<SnapshotSharedMemory<GuestSharedMemory>>,
-    /// New scratch memory to map in place of the old.
-    pub(crate) scratch: Option<GuestSharedMemory>,
-    /// How scratch was zeroed in place, and how long it took.
-    pub(crate) scratch_zeroed: Option<ScratchZeroed>,
-}
-
-/// How a restore zeroed scratch in place, and how long it took.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ScratchZeroed {
-    /// All of it, not knowing what was written.
-    All(std::time::Duration),
-    /// The pages written since the last restore.
-    Written(std::time::Duration),
-}
-
 /// A struct that is responsible for laying out and managing the memory
 /// for a given `Sandbox`.
 pub(crate) struct SandboxMemoryManager<S: SharedMemory> {
@@ -344,7 +324,7 @@ impl SandboxMemoryManager<ExclusiveSharedMemory> {
     pub(crate) fn from_snapshot(s: &Snapshot) -> Result<Self> {
         let layout = *s.layout();
         let shared_mem = s.memory().to_mgr_snapshot_mem()?;
-        let scratch_mem = ExclusiveSharedMemory::new(s.layout().get_scratch_size())?;
+        let scratch_mem = ExclusiveSharedMemory::new_scratch(s.layout().get_scratch_size())?;
         let next_action = s.next_action();
         let mut mgr = Self::new(layout, shared_mem, scratch_mem, next_action);
         mgr.original_entrypoint = s.original_entrypoint();
@@ -500,7 +480,10 @@ impl SandboxMemoryManager<HostSharedMemory> {
         &mut self,
         snapshot: &Snapshot,
         guest_written: Option<&mut Vec<u64>>,
-    ) -> Result<RestoredMemory> {
+    ) -> Result<(
+        Option<SnapshotSharedMemory<GuestSharedMemory>>,
+        Option<GuestSharedMemory>,
+    )> {
         let gsnapshot = if *snapshot.memory() == self.shared_mem {
             // If the snapshot memory is already the correct memory,
             // which is readonly, don't bother with restoring it,
@@ -517,31 +500,21 @@ impl SandboxMemoryManager<HostSharedMemory> {
             Some(gsnapshot)
         };
         let new_scratch_size = snapshot.layout().get_scratch_size();
-        let mut scratch_zeroed = None;
         let gscratch = if new_scratch_size == self.scratch_mem.mem_size() {
             match guest_written {
                 Some(written) => {
                     // The page tables are copied in with exclusive
                     // access, which the host-write log does not see.
-                    let took = self
-                        .scratch_mem
+                    self.scratch_mem
                         .zero_written(written, self.scratch_pt_range())?;
-                    scratch_zeroed = Some(ScratchZeroed::Written(took));
                     None
                 }
-                None => {
-                    let start = std::time::Instant::now();
-                    // zero_or_replace picks the fastest zeroing strategy for
-                    // the current platform (see SharedMemory::zero_or_replace).
-                    let gscratch = self.scratch_mem.zero_or_replace(&mut self.scratch_reset)?;
-                    if gscratch.is_none() {
-                        scratch_zeroed = Some(ScratchZeroed::All(start.elapsed()));
-                    }
-                    gscratch
-                }
+                // zero_or_replace picks the fastest zeroing strategy for
+                // the current platform (see SharedMemory::zero_or_replace).
+                None => self.scratch_mem.zero_or_replace(&mut self.scratch_reset)?,
             }
         } else {
-            let new_scratch_mem = ExclusiveSharedMemory::new(new_scratch_size)?;
+            let new_scratch_mem = ExclusiveSharedMemory::new_scratch(new_scratch_size)?;
             let (hscratch, gscratch) = new_scratch_mem.build();
             // Even though this destroys the reference to the host
             // side of the old scratch mapping, the VM should still
@@ -549,7 +522,6 @@ impl SandboxMemoryManager<HostSharedMemory> {
             // mapping, so it won't actually be deallocated until it
             // has been unmapped from the VM.
             self.scratch_mem = hscratch;
-            self.scratch_reset = ScratchReset::default();
             Some(gscratch)
         };
         self.layout = *snapshot.layout();
@@ -563,11 +535,7 @@ impl SandboxMemoryManager<HostSharedMemory> {
         self.original_entrypoint = snapshot.original_entrypoint();
 
         self.update_scratch_bookkeeping()?;
-        Ok(RestoredMemory {
-            snapshot: gsnapshot,
-            scratch: gscratch,
-            scratch_zeroed,
-        })
+        Ok((gsnapshot, gscratch))
     }
 
     #[inline]
