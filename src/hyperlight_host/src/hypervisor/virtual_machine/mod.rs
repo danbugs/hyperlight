@@ -436,10 +436,7 @@ pub(crate) enum DirtyTracking {
     /// It does not.
     None,
     /// For the scratch region, from when it is mapped (WHP).
-    #[cfg_attr(
-        not(all(target_os = "windows", target_arch = "x86_64")),
-        allow(dead_code)
-    )]
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     Mapped,
     /// For the whole VM, switched on and off (MSHV). While on, the
     /// guest's first write to a page after each read faults to the

@@ -9,7 +9,7 @@ use hyperlight_common::outb::VmAction;
 use tracing::Span;
 #[cfg(feature = "trace_guest")]
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use windows::Win32::Foundation::{E_INVALIDARG, FreeLibrary, HANDLE};
+use windows::Win32::Foundation::{FreeLibrary, HANDLE};
 use windows::Win32::System::Hypervisor::*;
 use windows::Win32::System::LibraryLoader::*;
 use windows::core::s;
@@ -40,7 +40,6 @@ use crate::hypervisor::virtual_machine::{
 };
 use crate::hypervisor::wrappers::HandleWrapper;
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags, MemoryRegionType};
-use crate::mem::shared_mem::DIRTY_PAGE_SIZE;
 #[cfg(feature = "trace_guest")]
 use crate::sandbox::trace::TraceContext as SandboxTraceContext;
 
@@ -454,21 +453,7 @@ impl DirtyLog for WhpVm {
         size: usize,
         bitmap: &mut Vec<u64>,
     ) -> Result<(), HypervisorError> {
-        // Every word is written: resize only.
-        bitmap.resize((size / DIRTY_PAGE_SIZE).div_ceil(64), 0);
-        let len = u32::try_from(bitmap.len() * size_of::<u64>())
-            .map_err(|_| windows_result::Error::from_hresult(E_INVALIDARG))?;
-        // The bits read are cleared.
-        unsafe {
-            WHvQueryGpaRangeDirtyBitmap(
-                self.partition,
-                gpa,
-                size as u64,
-                Some(bitmap.as_mut_ptr()),
-                len,
-            )?
-        };
-        Ok(())
+        super::read_dirty_bitmap(self.partition, gpa, size, bitmap)
     }
 }
 
@@ -511,23 +496,21 @@ impl VirtualMachine for WhpVm {
             }
         };
 
-        if region.region_type == MemoryRegionType::Scratch && !self.dirty_tracking_failed {
+        if region.region_type == MemoryRegionType::Scratch {
+            self.scratch_dirty_tracked = false;
             // Tracking lets a restore zero only the pages the guest wrote.
             // Without it, scratch is mapped as before.
             let tracked = flags | WHvMapGpaRangeFlagTrackDirtyPages;
-            self.scratch_dirty_tracked = match self.map_gpa_range(region, surrogate_addr, tracked) {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::debug!("Mapping scratch with dirty tracking failed: {e}");
-                    self.dirty_tracking_failed = true;
-                    self.map_gpa_range(region, surrogate_addr, flags)?;
-                    false
-                }
-            };
-        } else {
-            if region.region_type == MemoryRegionType::Scratch {
-                self.scratch_dirty_tracked = false;
+            if self.dirty_tracking_failed {
+                self.map_gpa_range(region, surrogate_addr, flags)?;
+            } else if let Err(e) = self.map_gpa_range(region, surrogate_addr, tracked) {
+                tracing::debug!("Mapping scratch with dirty tracking failed: {e}");
+                self.dirty_tracking_failed = true;
+                self.map_gpa_range(region, surrogate_addr, flags)?;
+            } else {
+                self.scratch_dirty_tracked = true;
             }
+        } else {
             self.map_gpa_range(region, surrogate_addr, flags)?;
         }
 
