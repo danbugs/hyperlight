@@ -418,16 +418,13 @@ impl MultiUseSandbox {
 
     fn restore_memory_and_mappings(&mut self, snapshot: &Snapshot) -> Result<()> {
         let guest_written = self.vm.scratch_dirty_pages();
-        let restored = self.mem_mgr.restore_snapshot(snapshot, guest_written)?;
-        if let Some(zeroed) = restored.scratch_zeroed {
-            self.vm.scratch_zeroed(zeroed);
-        }
-        if let Some(snapshot_mem) = restored.snapshot {
+        let (snapshot_mem, scratch_mem) = self.mem_mgr.restore_snapshot(snapshot, guest_written)?;
+        if let Some(snapshot_mem) = snapshot_mem {
             self.vm
                 .update_snapshot_mapping(snapshot_mem)
                 .map_err(HyperlightVmError::UpdateRegion)?;
         }
-        if let Some(scratch_mem) = restored.scratch {
+        if let Some(scratch_mem) = scratch_mem {
             self.vm
                 .update_scratch_mapping(scratch_mem)
                 .map_err(HyperlightVmError::UpdateRegion)?;
@@ -1405,9 +1402,8 @@ mod tests {
     }
 
     /// Restores that zero only the scratch pages written since the last
-    /// one leave nothing behind: while tracking starts, while the guest
-    /// writes much of scratch (which switches MSHV tracking off), and
-    /// when tracking starts again.
+    /// one leave nothing behind: from the first restore on, and after the
+    /// guest writes much of scratch (which stops MSHV tracking).
     #[test]
     fn restore_zeroes_every_scratch_page_written() {
         // After a restore, scratch holds only what the host wrote: each

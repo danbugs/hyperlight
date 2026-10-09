@@ -205,6 +205,25 @@ mod msr_mapping_tests {
 
 /// Helper: release a host-side file mapping view and its handle.
 /// Called from both `unmap_memory` and `WhpVm::drop`.
+/// Set `bitmap` to the pages of [`DIRTY_PAGE_SIZE`] in `[gpa, gpa + size)`
+/// the guest wrote since the last read, and clear them.
+fn read_dirty_bitmap(
+    partition: WHV_PARTITION_HANDLE,
+    gpa: u64,
+    size: usize,
+    bitmap: &mut Vec<u64>,
+) -> Result<(), HypervisorError> {
+    // Every word is written: resize only.
+    bitmap.resize((size / DIRTY_PAGE_SIZE).div_ceil(64), 0);
+    let len = u32::try_from(bitmap.len() * size_of::<u64>())
+        .map_err(|_| windows_result::Error::from_hresult(E_INVALIDARG))?;
+    // SAFETY: `bitmap` holds `len` bytes, which the call fills.
+    unsafe {
+        WHvQueryGpaRangeDirtyBitmap(partition, gpa, size as u64, Some(bitmap.as_mut_ptr()), len)?
+    };
+    Ok(())
+}
+
 fn release_file_mapping(view_base: *mut c_void, mapping_handle: HandleWrapper) {
     unsafe {
         if let Err(e) = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view_base }) {
@@ -471,21 +490,7 @@ impl DirtyLog for WhpVm {
         size: usize,
         bitmap: &mut Vec<u64>,
     ) -> Result<(), HypervisorError> {
-        // Every word is written: resize only.
-        bitmap.resize((size / DIRTY_PAGE_SIZE).div_ceil(64), 0);
-        let len = u32::try_from(bitmap.len() * size_of::<u64>())
-            .map_err(|_| windows_result::Error::from_hresult(E_INVALIDARG))?;
-        // The bits read are cleared.
-        unsafe {
-            WHvQueryGpaRangeDirtyBitmap(
-                self.partition,
-                gpa,
-                size as u64,
-                Some(bitmap.as_mut_ptr()),
-                len,
-            )?
-        };
-        Ok(())
+        read_dirty_bitmap(self.partition, gpa, size, bitmap)
     }
 }
 
@@ -528,23 +533,21 @@ impl VirtualMachine for WhpVm {
             }
         };
 
-        if region.region_type == MemoryRegionType::Scratch && !self.dirty_tracking_failed {
+        if region.region_type == MemoryRegionType::Scratch {
+            self.scratch_dirty_tracked = false;
             // Tracking lets a restore zero only the pages the guest wrote.
             // Without it, scratch is mapped as before.
             let tracked = flags | WHvMapGpaRangeFlagTrackDirtyPages;
-            self.scratch_dirty_tracked = match self.map_gpa_range(region, surrogate_addr, tracked) {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::debug!("Mapping scratch with dirty tracking failed: {e}");
-                    self.dirty_tracking_failed = true;
-                    self.map_gpa_range(region, surrogate_addr, flags)?;
-                    false
-                }
-            };
-        } else {
-            if region.region_type == MemoryRegionType::Scratch {
-                self.scratch_dirty_tracked = false;
+            if self.dirty_tracking_failed {
+                self.map_gpa_range(region, surrogate_addr, flags)?;
+            } else if let Err(e) = self.map_gpa_range(region, surrogate_addr, tracked) {
+                tracing::debug!("Mapping scratch with dirty tracking failed: {e}");
+                self.dirty_tracking_failed = true;
+                self.map_gpa_range(region, surrogate_addr, flags)?;
+            } else {
+                self.scratch_dirty_tracked = true;
             }
+        } else {
             self.map_gpa_range(region, surrogate_addr, flags)?;
         }
 
