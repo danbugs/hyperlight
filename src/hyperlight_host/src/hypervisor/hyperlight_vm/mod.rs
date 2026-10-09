@@ -39,7 +39,7 @@ use crate::hypervisor::virtual_machine::{
 };
 use crate::hypervisor::{InterruptHandle, InterruptHandleImpl};
 use crate::mem::memory_region::{MemoryRegion, MemoryRegionFlags, MemoryRegionType};
-use crate::mem::mgr::{SandboxMemoryManager, ScratchZeroed, SnapshotSharedMemory};
+use crate::mem::mgr::{SandboxMemoryManager, SnapshotSharedMemory};
 use crate::mem::shared_mem::{GuestSharedMemory, HostSharedMemory, SharedMemory};
 use crate::metrics::{METRIC_ERRONEOUS_VCPU_KICKS, METRIC_GUEST_CANCELLATION};
 use crate::sandbox::host_funcs::FunctionRegistry;
@@ -549,12 +549,6 @@ impl HyperlightVm {
         self.scratch_dirty.take(&mut *self.vm, gpa, size)
     }
 
-    /// How the restore after
-    /// [`scratch_dirty_pages`](Self::scratch_dirty_pages) zeroed scratch.
-    pub(crate) fn scratch_zeroed(&mut self, zeroed: ScratchZeroed) {
-        self.scratch_dirty.zeroed(zeroed);
-    }
-
     /// Update the scratch mapping to point to a new GuestSharedMemory
     pub(crate) fn update_scratch_mapping(
         &mut self,
@@ -567,11 +561,16 @@ impl HyperlightVm {
         if let Some(old_scratch) = self.scratch_memory.as_ref() {
             let old_base = hyperlight_common::layout::scratch_base_gpa(old_scratch.mem_size());
             let old_rgn = old_scratch.mapping_at(old_base, MemoryRegionType::Scratch);
+            self.scratch_dirty
+                .unmapping(&mut *self.vm, old_base, old_rgn.guest_region.len());
             self.vm.unmap_memory((self.scratch_slot, &old_rgn))?;
         }
         self.scratch_memory = None;
         unsafe { self.vm.map_memory((self.scratch_slot, &rgn))? };
         self.scratch_memory = Some(scratch);
+        // Track the guest's writes to it from before the guest runs.
+        self.scratch_dirty
+            .mapped(&mut *self.vm, guest_base, rgn.guest_region.len());
 
         Ok(())
     }

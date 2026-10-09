@@ -951,6 +951,33 @@ impl ExclusiveSharedMemory {
     }
 }
 
+impl ExclusiveSharedMemory {
+    /// New memory for a sandbox's scratch region. On KVM it is backed 4
+    /// KiB at a time: KVM maps scratch 4 KiB at a time, since it is not
+    /// 2 MiB aligned for the guest, so a huge page would only make a touch,
+    /// and a reset that zeroes the touched pages (see `ScratchReset`), zero
+    /// 2 MiB.
+    pub(crate) fn new_scratch(size: usize) -> Result<Self> {
+        let mem = Self::new(size)?;
+        #[cfg(all(kvm, not(miri)))]
+        if matches!(
+            crate::hypervisor::virtual_machine::get_available_hypervisor(),
+            Some(crate::hypervisor::virtual_machine::HypervisorType::Kvm)
+        ) {
+            // SAFETY: the region is a private anonymous mapping of our
+            // own. Failure leaves the default page size, so it is ignored.
+            unsafe {
+                libc::madvise(
+                    mem.base_ptr() as *mut libc::c_void,
+                    mem.mem_size(),
+                    libc::MADV_NOHUGEPAGE,
+                )
+            };
+        }
+        Ok(mem)
+    }
+}
+
 impl SharedMemory for ExclusiveSharedMemory {
     fn region(&self) -> &HostMapping {
         &self.region
@@ -1496,15 +1523,11 @@ impl HostSharedMemory {
     /// `written` comes from the hypervisor's dirty log, which sees only
     /// the guest's writes. `also` covers host writes made with
     /// exclusive access, which are not logged.
-    ///
-    /// Returns how long zeroing took, leaving out the check debug builds
-    /// make that nothing else was written.
     pub(crate) fn zero_written(
         &mut self,
         written: &mut Vec<u64>,
         also: Range<usize>,
-    ) -> Result<std::time::Duration> {
-        let start = std::time::Instant::now();
+    ) -> Result<()> {
         let pages = self.mem_size() / DIRTY_PAGE_SIZE;
         written.resize(written.len().max(pages.div_ceil(64)), 0);
         let also = also.start / DIRTY_PAGE_SIZE..also.end.div_ceil(DIRTY_PAGE_SIZE).min(pages);
@@ -1519,13 +1542,11 @@ impl HostSharedMemory {
             for run in DirtyRuns::new(written, pages) {
                 mem[run.start * DIRTY_PAGE_SIZE..run.end * DIRTY_PAGE_SIZE].fill(0);
             }
-            let took = start.elapsed();
             debug_assert!(
                 mem.chunks(DIRTY_PAGE_SIZE)
                     .all(|page| page == &ZERO_PAGE[..page.len()]),
                 "a scratch page written since the last reset was not logged"
             );
-            took
         })
     }
 
@@ -1541,14 +1562,12 @@ impl HostSharedMemory {
     /// mappings must stay in sync with userspace, it is zeroed with
     /// `fill(0)`.
     ///
-    /// On Windows, scratch up to [`RESIDENT_SCRATCH_MAX`] is zeroed with
+    /// On Windows, scratch up to [`FILL_IN_PLACE_MAX`] is zeroed with
     /// `fill(0)`. Larger scratch is replaced with a fresh demand-zero
     /// allocation, since `fill(0)` takes long and makes all of it
     /// resident (e.g. 448 MiB scratch). Returns `Some(GuestSharedMemory)`
     /// when the mapping was replaced (the caller must update the VM
     /// mapping), or `None` when zeroed in place.
-    ///
-    /// [`RESIDENT_SCRATCH_MAX`]: super::RESIDENT_SCRATCH_MAX
     pub(crate) fn zero_or_replace(
         &mut self,
         #[cfg_attr(not(all(kvm, not(miri))), allow(unused_variables))] state: &mut ScratchReset,
@@ -1556,8 +1575,8 @@ impl HostSharedMemory {
         // Zeroing in place makes the whole region resident; above the cap,
         // Windows maps fresh memory instead (#1765).
         #[cfg(target_os = "windows")]
-        if self.mem_size() > super::RESIDENT_SCRATCH_MAX {
-            let new_mem = ExclusiveSharedMemory::new(self.mem_size())?;
+        if self.mem_size() > FILL_IN_PLACE_MAX {
+            let new_mem = ExclusiveSharedMemory::new_scratch(self.mem_size())?;
             let (hscratch, gscratch) = new_mem.build();
             *self = hscratch;
             return Ok(Some(gscratch));
@@ -1595,6 +1614,15 @@ impl HostSharedMemory {
         Ok(None)
     }
 }
+
+/// On Windows without a dirty log, the largest scratch zeroed in place.
+/// Zeroing in place makes all of scratch resident, where a fresh mapping
+/// holds only what the next run touches (#1765), so larger scratch is
+/// replaced. Below it, zeroing in place is about 2x faster than a fresh
+/// mapping, and over 5x when the guest writes a megabyte or more, since
+/// a fresh mapping faults on every page touched.
+#[cfg(target_os = "windows")]
+const FILL_IN_PLACE_MAX: usize = 16 << 20;
 
 /// The page size of dirty-page bitmaps: hypervisor dirty logs and
 /// [`HostWrites`].
@@ -1813,17 +1841,17 @@ mod zero_written_tests {
     #[test]
     #[cfg(target_os = "windows")]
     fn windows_replaces_only_large_scratch() {
-        use crate::mem::RESIDENT_SCRATCH_MAX;
+        use super::FILL_IN_PLACE_MAX;
         let mut state = crate::mem::scratch_reset::ScratchReset::default();
-        let mut small = scratch(RESIDENT_SCRATCH_MAX / PAGE);
+        let mut small = scratch(FILL_IN_PLACE_MAX / PAGE);
         guest_write(&mut small, 3, 1);
         small.write::<u8>(5 * PAGE, 1).unwrap();
         assert!(small.zero_or_replace(&mut state).unwrap().is_none());
         assert!(nonzero_pages(&mut small).is_empty());
-        let mut bitmap = vec![0; RESIDENT_SCRATCH_MAX / PAGE / 64];
+        let mut bitmap = vec![0; FILL_IN_PLACE_MAX / PAGE / 64];
         small.host_writes.take_into(&mut bitmap);
         assert!(bitmap.iter().all(|&w| w == 0));
-        let mut large = scratch(RESIDENT_SCRATCH_MAX / PAGE + 1);
+        let mut large = scratch(FILL_IN_PLACE_MAX / PAGE + 1);
         assert!(large.zero_or_replace(&mut state).unwrap().is_some());
     }
 

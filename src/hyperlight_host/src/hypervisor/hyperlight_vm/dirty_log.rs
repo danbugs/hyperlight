@@ -9,6 +9,12 @@
 //! hypervisor logs the guest's writes, a restore zeroes only the pages
 //! in the log (see [`HostSharedMemory::zero_written`]).
 //!
+//! Tracking starts when scratch is mapped, before the guest runs, so
+//! every restore, the first included, has the log. On MSHV the log is
+//! not read until the first restore: until then every page reads as
+//! written, so the guest sets up without tracking faults and the first
+//! restore zeroes all of scratch, which MSHV holds resident anyway.
+//!
 //! On WHP, scratch is mapped with tracking, which costs the guest
 //! nothing measurable, so the log is always used. Scratch is no longer
 //! replaced on each restore, so the pages the guest writes stay
@@ -18,52 +24,47 @@
 //! On MSHV, tracking is switched on for the whole VM. While it is on,
 //! the guest's first write to each page after a read faults to the
 //! hypervisor, and reading the log costs time in the size of scratch.
-//! When reading the log, the faults and zeroing what was written cost
-//! more than zeroing all of scratch, as when the guest writes most of it
-//! or scratch is small, tracking is switched off, and retried later.
-//! Each is measured as restores run, except the fault, which is
-//! [`WRITE_FAULT`]. Each restore that zeroes all of scratch is timed and
-//! the fastest kept, since a slower one was cold or interrupted;
-//! [`WARM_RESETS`] gives warm ones before tracking first starts.
+//! Measured on MSHV, that costs more than zeroing all of scratch when
+//! scratch is under [`MIN_TRACKED_SCRATCH`], or when a run writes more
+//! of it than [`writes_much`] allows. Small scratch is not tracked, and
+//! tracking stops after such a run, until scratch is mapped again.
 //!
 //! [`HostSharedMemory::zero_written`]: crate::mem::shared_mem::HostSharedMemory::zero_written
-
-use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 
 use crate::hypervisor::virtual_machine::{DirtyLog, DirtyTracking, HypervisorError};
-use crate::mem::mgr::ScratchZeroed;
 use crate::mem::shared_mem::{DIRTY_PAGE_SIZE, DirtyRuns};
 
-/// What tracking costs the guest per page it writes: the fault on its
-/// first write after a read. Measured on MSHV nested in an Azure VM as
-/// the difference per written page between tracked and untracked
-/// restores (so it also holds the zeroing, counted again from
-/// [`ScratchZeroed::Written`]); without nesting the fault costs less,
-/// so this errs toward zeroing all.
-const WRITE_FAULT: Duration = Duration::from_micros(1);
+/// The smallest scratch tracked on MSHV. At 1 MiB, tracking a guest
+/// that writes nothing costs as much as zeroing all of scratch; from 2
+/// MiB on it costs less.
+const MIN_TRACKED_SCRATCH: usize = 2 << 20;
 
-/// Restores in a row tracking must cost more than zeroing all of
-/// scratch before it is switched off.
-const COSTLIER_RESETS: u32 = 3;
+/// Scratch from which zeroing all of it costs about three times more per
+/// MiB on MSHV, so tracking pays off for runs that write more of it.
+const LARGE_SCRATCH: usize = 32 << 20;
 
-/// Restores tracking stays off before it is retried.
-const OFF_RESETS: u32 = 256;
-
-/// Restores that zero all of scratch before tracking first starts. The
-/// first touches memory not yet backed, so it is not a fair measure.
-const WARM_RESETS: u32 = 2;
+/// On MSHV, whether a run that wrote `written` of `pages` costs more
+/// tracked than zeroing all of scratch would. Measured, tracking costs
+/// more past about 5-10% of scratch written below [`LARGE_SCRATCH`] and
+/// past about 25% from it on.
+fn writes_much(written: usize, pages: usize) -> bool {
+    let share = if pages * DIRTY_PAGE_SIZE < LARGE_SCRATCH {
+        10
+    } else {
+        4
+    };
+    written * share > pages
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
-    /// Not tracking; restores zero everything. Tracking starts after
-    /// `left` more restores.
-    Off { left: u32 },
-    /// Tracking since the last restore. It cost more than zeroing all of
-    /// scratch for the last `costlier` restores.
-    On { costlier: u32 },
-    /// The hypervisor failed; restores zero everything.
+    /// Not tracking: scratch is reset in full.
+    Off,
+    /// Tracking since the last restore.
+    On,
+    /// The hypervisor failed; scratch is reset in full.
     Failed,
 }
 
@@ -77,143 +78,122 @@ pub(crate) struct ScratchDirtyLog {
     bitmap: Vec<u64>,
     /// Tracking is switched on in the hypervisor.
     enabled: bool,
-    /// The fastest restore that zeroed all of scratch, since tracking
-    /// was last switched off.
-    zero_all: Option<Duration>,
-    /// How long the last restore took to zero what was written.
-    zero_written: Duration,
-    /// The scratch range, (gpa, size), these apply to. Another one
-    /// starts over.
-    range: (u64, usize),
+    /// No restore has read the log since scratch was mapped.
+    since_mapped: bool,
 }
 
 impl Default for ScratchDirtyLog {
     fn default() -> Self {
         Self {
-            state: State::Off { left: WARM_RESETS },
+            state: State::Off,
             bitmap: Vec::new(),
             enabled: false,
-            zero_all: None,
-            zero_written: Duration::ZERO,
-            range: (0, 0),
+            since_mapped: false,
         }
     }
 }
 
 impl ScratchDirtyLog {
+    /// Scratch at `[gpa, gpa + size)` was just mapped, before the guest
+    /// runs on it. Start tracking it where that pays off.
+    pub(crate) fn mapped(&mut self, vm: &mut (impl DirtyLog + ?Sized), gpa: u64, size: usize) {
+        if self.state == State::Failed {
+            return;
+        }
+        self.since_mapped = true;
+        let result = match vm.dirty_tracking() {
+            DirtyTracking::Switched if size >= MIN_TRACKED_SCRATCH => {
+                vm.enable_dirty_tracking().map(|()| self.enabled = true)
+            }
+            // Cleared now: the first restore zeroes only what was written
+            // since, leaving the rest of scratch untouched (not resident).
+            DirtyTracking::Mapped => vm.read_dirty_log(gpa, size, &mut self.bitmap),
+            _ => {
+                self.state = State::Off;
+                return;
+            }
+        };
+        self.state = match result {
+            Ok(()) => State::On,
+            Err(e) => self.fail(vm, gpa, size, e),
+        };
+    }
+
+    /// Scratch at `[gpa, gpa + size)` is about to be unmapped. Tracking
+    /// is switched off while the range is still mapped, since MSHV stops
+    /// only once the bits of every page it read are set again.
+    pub(crate) fn unmapping(&mut self, vm: &mut (impl DirtyLog + ?Sized), gpa: u64, size: usize) {
+        if self.enabled {
+            match vm.disable_dirty_tracking(gpa, size) {
+                Ok(()) => self.enabled = false,
+                Err(e) => self.state = failed(e),
+            }
+        }
+        if self.state != State::Failed {
+            self.state = State::Off;
+        }
+    }
+
     /// Called once per restore, before scratch at `[gpa, gpa + size)`
     /// is reset. Returns the pages the guest wrote since the last
-    /// restore, one bit per 4 KiB page, or `None` when they are not
-    /// known and all of scratch must be reset. Then the caller reports
-    /// how it zeroed scratch with [`zeroed`](Self::zeroed).
+    /// restore, one bit per page of [`DIRTY_PAGE_SIZE`], or `None` when
+    /// they are not known and all of scratch must be reset. The log read
+    /// is cleared: a restore that then fails leaves the sandbox
+    /// unrecoverable, so nothing restores it on a log missing those pages.
     pub(crate) fn take(
         &mut self,
         vm: &mut (impl DirtyLog + ?Sized),
         gpa: u64,
         size: usize,
     ) -> Option<&mut Vec<u64>> {
-        let result = match vm.dirty_tracking() {
-            DirtyTracking::None => return None,
-            _ if self.state == State::Failed => return None,
-            DirtyTracking::Mapped => vm
-                .read_dirty_log(gpa, size, &mut self.bitmap)
-                .map(|()| true),
-            DirtyTracking::Switched => self.switched(vm, gpa, size),
-        };
-        match result {
-            Ok(true) => Some(&mut self.bitmap),
-            Ok(false) => None,
-            Err(e) => {
-                warn!("Scratch dirty log failed, restores zero all of scratch from now on: {e}");
-                self.state = State::Failed;
-                // Best effort. Left on, tracking costs each page one fault
-                // at most: pages fault only after a read clears them.
-                if self.enabled && vm.disable_dirty_tracking(gpa, size).is_ok() {
-                    self.enabled = false;
-                }
-                None
+        if self.state != State::On {
+            return None;
+        }
+        if let Err(e) = vm.read_dirty_log(gpa, size, &mut self.bitmap) {
+            self.state = self.fail(vm, gpa, size, e);
+            return None;
+        }
+        // The first log after mapping holds what the guest wrote setting
+        // up, before its first snapshot, which is not a run.
+        let first = std::mem::take(&mut self.since_mapped);
+        if vm.dirty_tracking() == DirtyTracking::Switched && !first {
+            let pages = size / DIRTY_PAGE_SIZE;
+            let written = written(&self.bitmap, pages);
+            if writes_much(written, pages) {
+                debug!("Scratch dirty tracking off: a run wrote {written} of {pages} pages");
+                // The log just read is right either way.
+                self.state = match vm.disable_dirty_tracking(gpa, size) {
+                    Ok(()) => {
+                        self.enabled = false;
+                        State::Off
+                    }
+                    Err(e) => failed(e),
+                };
             }
         }
+        Some(&mut self.bitmap)
     }
 
-    /// How the restore after [`take`](Self::take) zeroed scratch.
-    pub(crate) fn zeroed(&mut self, zeroed: ScratchZeroed) {
-        match zeroed {
-            ScratchZeroed::All(took) => {
-                self.zero_all = Some(self.zero_all.map_or(took, |fastest| fastest.min(took)));
-            }
-            // Kept for the next decision, unless tracking just stopped.
-            ScratchZeroed::Written(took) if matches!(self.state, State::On { .. }) => {
-                self.zero_written = took;
-            }
-            ScratchZeroed::Written(_) => {}
-        }
-    }
-
-    /// Step the switched-tracking state; true when `self.bitmap` holds
-    /// the pages written since the last restore.
-    fn switched(
+    fn fail(
         &mut self,
         vm: &mut (impl DirtyLog + ?Sized),
         gpa: u64,
         size: usize,
-    ) -> Result<bool, HypervisorError> {
-        if (gpa, size) != self.range {
-            // Scratch was replaced: what was measured is of another one.
-            // Tracking stays on, since the old range is unmapped and
-            // MSHV disables it only over ranges read; the new range was
-            // never read, so it costs the guest nothing until it is.
-            self.state = State::Off { left: WARM_RESETS };
-            self.range = (gpa, size);
-            self.zero_all = None;
-            self.zero_written = Duration::ZERO;
+        e: HypervisorError,
+    ) -> State {
+        // Best effort. Left on, tracking costs each page one fault at
+        // most: pages fault only after a read clears them.
+        if self.enabled && vm.disable_dirty_tracking(gpa, size).is_ok() {
+            self.enabled = false;
         }
-        match self.state {
-            State::Failed => Ok(false),
-            State::Off { left: left @ 1.. } => {
-                self.state = State::Off { left: left - 1 };
-                Ok(false)
-            }
-            State::Off { left: 0 } => {
-                // This restore zeroes everything. The first read after
-                // enabling may report every page, so it is read away now.
-                if !self.enabled {
-                    vm.enable_dirty_tracking()?;
-                    self.enabled = true;
-                }
-                vm.read_dirty_log(gpa, size, &mut self.bitmap)?;
-                self.state = State::On { costlier: 0 };
-                Ok(false)
-            }
-            State::On { costlier } => {
-                let start = Instant::now();
-                vm.read_dirty_log(gpa, size, &mut self.bitmap)?;
-                let pages = written(&self.bitmap, size / DIRTY_PAGE_SIZE);
-                let cost = start.elapsed()
-                    + self.zero_written
-                    + WRITE_FAULT * u32::try_from(pages).unwrap_or(u32::MAX);
-                let costlier = match self.zero_all {
-                    Some(zero_all) if cost > zero_all => costlier + 1,
-                    _ => 0,
-                };
-                self.state = if costlier >= COSTLIER_RESETS {
-                    debug!(
-                        "Scratch dirty tracking off for {OFF_RESETS} restores: {cost:?} a restore, \
-                         zeroing all {:?}",
-                        self.zero_all
-                    );
-                    vm.disable_dirty_tracking(gpa, size)?;
-                    self.enabled = false;
-                    self.zero_all = None;
-                    self.zero_written = Duration::ZERO;
-                    State::Off { left: OFF_RESETS }
-                } else {
-                    State::On { costlier }
-                };
-                Ok(true)
-            }
-        }
+        failed(e)
     }
+}
+
+/// The log failed after `e`: scratch is reset in full from now on.
+fn failed(e: HypervisorError) -> State {
+    warn!("Scratch dirty log failed, restores zero all of scratch from now on: {e}");
+    State::Failed
 }
 
 /// The set bits below `pages` in `bitmap`.
@@ -227,7 +207,7 @@ mod tests {
 
     const GPA: u64 = 0x1_0000_0000;
     const SIZE: usize = 16 << 20;
-    const PAGES: usize = SIZE / 4096;
+    const PAGES: usize = SIZE / DIRTY_PAGE_SIZE;
 
     /// A VM whose guest writes the first `written` pages between reads.
     #[derive(Debug, Default, PartialEq, Eq)]
@@ -238,8 +218,6 @@ mod tests {
         enables: u32,
         disables: u32,
         reads: u32,
-        /// The range the last disable was given.
-        disabled: Option<(u64, usize)>,
     }
 
     impl DirtyLog for FakeVm {
@@ -250,9 +228,8 @@ mod tests {
             self.enables += 1;
             Ok(())
         }
-        fn disable_dirty_tracking(&mut self, gpa: u64, size: usize) -> Result<(), HypervisorError> {
+        fn disable_dirty_tracking(&mut self, _: u64, _: usize) -> Result<(), HypervisorError> {
             self.disables += 1;
-            self.disabled = Some((gpa, size));
             Ok(())
         }
         fn read_dirty_log(
@@ -261,12 +238,12 @@ mod tests {
             size: usize,
             bitmap: &mut Vec<u64>,
         ) -> Result<(), HypervisorError> {
-            assert_eq!((gpa, size % 4096), (GPA, 0));
+            assert_eq!((gpa, size % DIRTY_PAGE_SIZE), (GPA, 0));
             if self.fail {
                 return Err(HypervisorError::Injected);
             }
             self.reads += 1;
-            *bitmap = vec![0; (size / 4096).div_ceil(64)];
+            *bitmap = vec![0; (size / DIRTY_PAGE_SIZE).div_ceil(64)];
             for page in 0..self.written {
                 bitmap[page / 64] |= 1 << (page % 64);
             }
@@ -282,23 +259,9 @@ mod tests {
         }
     }
 
-    /// A restore as the sandbox does one: zeroing all of scratch in
-    /// `zero_all` when the log does not say what was written.
-    fn restore(log: &mut ScratchDirtyLog, vm: &mut FakeVm, zero_all: Duration) -> Option<usize> {
-        match log.take(vm, GPA, SIZE) {
-            Some(bitmap) => {
-                let pages = written(bitmap, PAGES);
-                log.zeroed(ScratchZeroed::Written(Duration::ZERO));
-                Some(pages)
-            }
-            None => {
-                log.zeroed(ScratchZeroed::All(zero_all));
-                None
-            }
-        }
+    fn restore(log: &mut ScratchDirtyLog, vm: &mut FakeVm) -> Option<usize> {
+        log.take(vm, GPA, SIZE).map(|bitmap| written(bitmap, PAGES))
     }
-
-    const MS: Duration = Duration::from_millis(1);
 
     #[test]
     fn written_counts_only_pages_in_range() {
@@ -311,160 +274,128 @@ mod tests {
     fn untracked_vms_have_no_log() {
         let mut vm = vm(DirtyTracking::None, 1);
         let mut log = ScratchDirtyLog::default();
-        assert_eq!(restore(&mut log, &mut vm, MS), None);
+        log.mapped(&mut vm, GPA, SIZE);
+        assert_eq!(restore(&mut log, &mut vm), None);
         assert_eq!((vm.enables, vm.disables, vm.reads), (0, 0, 0));
     }
 
+    /// Read when mapped, so every restore, the first included, zeroes
+    /// what the log says, whatever the guest writes.
     #[test]
     fn mapped_tracking_is_always_read() {
-        let mut vm = vm(DirtyTracking::Mapped, PAGES);
+        let mut vm = vm(DirtyTracking::Mapped, PAGES / 2);
         let mut log = ScratchDirtyLog::default();
+        log.mapped(&mut vm, GPA, SIZE);
         for _ in 0..10 {
-            assert_eq!(restore(&mut log, &mut vm, MS), Some(PAGES));
+            assert_eq!(restore(&mut log, &mut vm), Some(PAGES / 2));
         }
-        assert_eq!((vm.enables, vm.disables, vm.reads), (0, 0, 10));
+        assert_eq!((vm.enables, vm.disables, vm.reads), (0, 0, 11));
     }
 
-    /// Restores before tracking first starts, and the one starting it.
-    fn start(log: &mut ScratchDirtyLog, vm: &mut FakeVm) {
-        for _ in 0..WARM_RESETS {
-            assert_eq!(restore(log, vm, MS), None);
-        }
-        assert_eq!(vm.enables, 0);
-        // Enabled and read away: everything is zeroed this time.
-        assert_eq!(restore(log, vm, MS), None);
-        assert_eq!((vm.enables, vm.reads), (1, 1));
-    }
-
+    /// Enabled when mapped and not read: the first log reports every page
+    /// (as the fake does by writing them all), later ones what was
+    /// written.
     #[test]
-    fn switched_tracking_starts_after_warming_up() {
-        let mut vm = vm(DirtyTracking::Switched, 1);
+    fn switched_tracking_starts_when_mapped() {
+        let mut vm = vm(DirtyTracking::Switched, PAGES);
         let mut log = ScratchDirtyLog::default();
-        start(&mut log, &mut vm);
+        log.mapped(&mut vm, GPA, SIZE);
+        assert_eq!((vm.enables, vm.reads), (1, 0));
+        assert_eq!(restore(&mut log, &mut vm), Some(PAGES));
+        assert_eq!(vm.disables, 0);
+        vm.written = 1;
         for _ in 0..1000 {
-            assert_eq!(restore(&mut log, &mut vm, MS), Some(1));
+            assert_eq!(restore(&mut log, &mut vm), Some(1));
         }
         assert_eq!(vm.disables, 0);
     }
 
     #[test]
-    fn costlier_tracking_is_switched_off_then_retried() {
-        // 2000 faults cost about 2 ms, more than zeroing all in 1 ms.
-        let mut vm = vm(DirtyTracking::Switched, 2000);
+    fn small_scratch_is_not_tracked() {
+        let size = MIN_TRACKED_SCRATCH - DIRTY_PAGE_SIZE;
+        let mut vm = vm(DirtyTracking::Switched, 1);
         let mut log = ScratchDirtyLog::default();
-        start(&mut log, &mut vm);
-        for _ in 0..COSTLIER_RESETS {
-            assert_eq!(restore(&mut log, &mut vm, MS), Some(2000));
-        }
+        log.mapped(&mut vm, GPA, size);
+        assert!(log.take(&mut vm, GPA, size).is_none());
+        assert_eq!((vm.enables, vm.reads), (0, 0));
+    }
+
+    /// A run that writes much of scratch stops tracking for good, and
+    /// its own log is still used. Setting up does not count.
+    #[test]
+    fn a_run_writing_much_stops_tracking() {
+        let mut vm = vm(DirtyTracking::Switched, PAGES);
+        let mut log = ScratchDirtyLog::default();
+        log.mapped(&mut vm, GPA, SIZE);
+        assert_eq!(restore(&mut log, &mut vm), Some(PAGES));
+        assert_eq!(vm.disables, 0);
+        vm.written = PAGES / 10 + 1;
+        assert_eq!(restore(&mut log, &mut vm), Some(PAGES / 10 + 1));
         assert_eq!(vm.disables, 1);
-        for _ in 0..OFF_RESETS {
-            assert_eq!(restore(&mut log, &mut vm, MS), None);
+        vm.written = 1;
+        for _ in 0..10 {
+            assert_eq!(restore(&mut log, &mut vm), None);
         }
         assert_eq!(vm.enables, 1);
-        // Retried.
-        assert_eq!(restore(&mut log, &mut vm, MS), None);
+    }
+
+    #[test]
+    fn larger_scratch_tolerates_more_writes() {
+        let large = LARGE_SCRATCH / DIRTY_PAGE_SIZE;
+        assert!(!writes_much(large / 4, large));
+        assert!(writes_much(large / 4 + 1, large));
+        assert!(!writes_much(PAGES / 10, PAGES));
+        assert!(writes_much(PAGES / 10 + 1, PAGES));
+    }
+
+    /// Unmapping switches tracking off over the range still mapped, and
+    /// the next mapping starts over, tracking again if it is large enough.
+    #[test]
+    fn remapping_stops_and_starts_over() {
+        let mut vm = vm(DirtyTracking::Switched, 1);
+        let mut log = ScratchDirtyLog::default();
+        log.mapped(&mut vm, GPA, SIZE);
+        restore(&mut log, &mut vm);
+        log.unmapping(&mut vm, GPA, SIZE);
+        assert_eq!(vm.disables, 1);
+        log.mapped(&mut vm, GPA, MIN_TRACKED_SCRATCH - DIRTY_PAGE_SIZE);
+        assert!(
+            log.take(&mut vm, GPA, MIN_TRACKED_SCRATCH - DIRTY_PAGE_SIZE)
+                .is_none()
+        );
+        log.unmapping(&mut vm, GPA, MIN_TRACKED_SCRATCH - DIRTY_PAGE_SIZE);
+        assert_eq!(vm.disables, 1);
+        log.mapped(&mut vm, GPA, SIZE);
+        assert_eq!(restore(&mut log, &mut vm), Some(1));
+        assert_eq!(restore(&mut log, &mut vm), Some(1));
         assert_eq!(vm.enables, 2);
-        assert_eq!(restore(&mut log, &mut vm, MS), Some(2000));
     }
 
+    /// A mapping that loses tracking has no log.
     #[test]
-    fn zeroing_what_was_written_counts() {
-        // One page written, but zeroing what was written (as when the host
-        // wrote much of scratch) takes longer than zeroing all.
-        let mut vm = vm(DirtyTracking::Switched, 1);
-        let mut log = ScratchDirtyLog::default();
-        start(&mut log, &mut vm);
-        for _ in 0..COSTLIER_RESETS + 1 {
-            if log.take(&mut vm, GPA, SIZE).is_some() {
-                log.zeroed(ScratchZeroed::Written(2 * MS));
-            }
-        }
-        assert_eq!(vm.disables, 1);
-        // Not counted against tracking when it is retried.
-        assert_eq!((log.zero_all, log.zero_written), (None, Duration::ZERO));
-    }
-
-    #[test]
-    fn tracking_stays_on_where_zeroing_all_costs_more() {
-        // The same writes, but zeroing all of a larger scratch costs 5 ms.
-        let mut vm = vm(DirtyTracking::Switched, 2000);
-        let mut log = ScratchDirtyLog::default();
-        for _ in 0..100 {
-            restore(&mut log, &mut vm, 5 * MS);
-        }
-        assert_eq!(vm.disables, 0);
-    }
-
-    #[test]
-    fn a_cheaper_restore_resets_the_count() {
-        let mut vm = vm(DirtyTracking::Switched, 2000);
-        let mut log = ScratchDirtyLog::default();
-        start(&mut log, &mut vm);
-        for _ in 0..COSTLIER_RESETS - 1 {
-            restore(&mut log, &mut vm, MS);
-        }
-        vm.written = 1;
-        restore(&mut log, &mut vm, MS);
-        vm.written = 2000;
-        for _ in 0..COSTLIER_RESETS - 1 {
-            assert!(restore(&mut log, &mut vm, MS).is_some());
-        }
-        assert_eq!(vm.disables, 0);
-    }
-
-    #[test]
-    fn a_failed_read_zeroes_everything_from_then_on() {
-        let mut vm = vm(DirtyTracking::Switched, 1);
-        let mut log = ScratchDirtyLog::default();
-        start(&mut log, &mut vm);
-        vm.fail = true;
-        assert_eq!(restore(&mut log, &mut vm, MS), None);
-        assert_eq!(vm.disables, 1);
-        vm.fail = false;
-        for _ in 0..OFF_RESETS + 2 {
-            assert_eq!(restore(&mut log, &mut vm, MS), None);
-        }
-        assert_eq!((vm.enables, vm.reads), (1, 1));
-    }
-
-    #[test]
-    fn a_failed_mapped_read_is_not_retried() {
+    fn a_mapping_without_tracking_has_no_log() {
         let mut vm = vm(DirtyTracking::Mapped, 1);
         let mut log = ScratchDirtyLog::default();
-        vm.fail = true;
-        assert_eq!(restore(&mut log, &mut vm, MS), None);
-        vm.fail = false;
-        assert_eq!(restore(&mut log, &mut vm, MS), None);
-        assert_eq!(vm.reads, 0);
+        log.mapped(&mut vm, GPA, SIZE);
+        log.unmapping(&mut vm, GPA, SIZE);
+        vm.tracking = Some(DirtyTracking::None);
+        log.mapped(&mut vm, GPA, SIZE);
+        assert!(log.take(&mut vm, GPA, SIZE).is_none());
     }
 
     #[test]
-    fn a_cold_first_zeroing_does_not_count() {
-        // The first restores zero cold memory slowly, and look costlier
-        // than tracking, which costs about 2 ms a restore here.
-        let mut vm = vm(DirtyTracking::Switched, 2000);
-        let mut log = ScratchDirtyLog::default();
-        restore(&mut log, &mut vm, 10 * MS);
-        for _ in 0..WARM_RESETS + COSTLIER_RESETS {
-            restore(&mut log, &mut vm, MS);
-        }
-        assert_eq!(vm.disables, 1);
-    }
-
-    #[test]
-    fn another_scratch_size_starts_over() {
+    fn a_failed_read_resets_in_full_from_then_on() {
         let mut vm = vm(DirtyTracking::Switched, 1);
         let mut log = ScratchDirtyLog::default();
-        start(&mut log, &mut vm);
-        assert_eq!(restore(&mut log, &mut vm, MS), Some(1));
-        assert!(log.take(&mut vm, GPA, SIZE * 2).is_none());
-        // Not disabled over the old range, which is unmapped, nor
-        // enabled twice.
-        assert_eq!((vm.disables, log.zero_all), (0, None));
-        for _ in 0..WARM_RESETS {
-            assert!(log.take(&mut vm, GPA, SIZE * 2).is_none());
+        log.mapped(&mut vm, GPA, SIZE);
+        vm.fail = true;
+        assert_eq!(restore(&mut log, &mut vm), None);
+        assert_eq!(vm.disables, 1);
+        vm.fail = false;
+        log.mapped(&mut vm, GPA, SIZE);
+        for _ in 0..10 {
+            assert_eq!(restore(&mut log, &mut vm), None);
         }
-        assert_eq!(vm.enables, 1);
-        assert!(log.take(&mut vm, GPA, SIZE * 2).is_some());
+        assert_eq!((vm.enables, vm.reads), (1, 0));
     }
 }
