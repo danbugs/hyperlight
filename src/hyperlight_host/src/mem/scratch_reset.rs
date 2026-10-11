@@ -22,12 +22,20 @@
 //! holds data as present or swapped, so this leaves no data behind.
 //! Pagemap is used only after it reports a page this process wrote, read
 //! by the process that opened it.
+//!
+//! From Linux 6.7, the `PAGEMAP_SCAN` ioctl reports pagemap as ranges of
+//! pages alike, skipping what was never touched, so a reset costs time
+//! in what scratch holds rather than in its size. It does not tell a page
+//! shared with a forked child from one of our own: one holding data is
+//! zeroed then, which copies it first, as safe as dropping it. Where the
+//! ioctl fails (an older kernel, a filter), entries are read one a page.
 
 use std::fs::File;
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::shared_mem::{ExclusiveSharedMemory, SharedMemory};
 
@@ -40,6 +48,13 @@ const MAX_DROPS: usize = 64;
 /// Pagemap entries read at once.
 const CHUNK_PAGES: usize = 512;
 
+/// Ranges one `PAGEMAP_SCAN` call reports.
+const SCAN_RANGES: usize = 256;
+
+/// `PAGEMAP_SCAN` failed in this process, so resets read entries one a
+/// page. Whether it works is the kernel's, not a sandbox's.
+static NO_RANGES: AtomicBool = AtomicBool::new(false);
+
 const PM_PRESENT: u64 = 1 << 63;
 const PM_SWAPPED: u64 = 1 << 62;
 const PM_EXCLUSIVE: u64 = 1 << 56;
@@ -51,6 +66,12 @@ pub(crate) struct ScratchReset {
     /// The process for which pagemap could not be used, so it is not
     /// opened again.
     unusable: Option<u32>,
+    /// Read entries one a page, to test that.
+    #[cfg(test)]
+    no_ranges: bool,
+    /// The last scan read ranges.
+    #[cfg(test)]
+    read_ranges: bool,
     /// Pagemap fails, to test that.
     #[cfg(test)]
     fail_pagemap: bool,
@@ -213,18 +234,28 @@ impl ScratchReset {
     /// [`Run::end`]). Returns the drops of runs that had to go, and stops
     /// past [`MAX_DROPS`] of them for the caller to drop it all.
     fn scan(&mut self, region: &mut Region<'_>) -> std::io::Result<usize> {
-        let mut counts = Drops::default();
+        #[cfg(test)]
+        let ranges = !self.no_ranges;
+        #[cfg(not(test))]
+        let ranges = true;
+        if ranges
+            && !NO_RANGES.load(Ordering::Relaxed)
+            && let Some(drops) = self.scan_ranges(region)?
+        {
+            #[cfg(test)]
+            {
+                self.read_ranges = true;
+            }
+            return Ok(drops);
+        }
+        self.scan_entries(region)
+    }
+
+    /// [`scan`](Self::scan) from pagemap entries, one a page.
+    fn scan_entries(&mut self, region: &mut Region<'_>) -> std::io::Result<usize> {
+        let mut walk = Walk::default();
         let mut entries = [0u64; CHUNK_PAGES];
         let pagemap = self.pagemap()?;
-        // The run being read, across chunks: kept or not, and for a run
-        // not kept, whether it holds shared or swapped pages, or pages
-        // the last run left zero.
-        let mut run = Run {
-            start: 0,
-            keep: true,
-            shared: false,
-            zero: false,
-        };
         let mut chunk = 0;
         while chunk < region.pages {
             let n = CHUNK_PAGES.min(region.pages - chunk);
@@ -234,28 +265,190 @@ impl ScratchReset {
                 let own = kept(entry);
                 let present = entry & PM_PRESENT != 0;
                 let zero = present && region.is_zero(page);
-                let keep = own && !zero;
-                if keep != run.keep {
-                    if run.end(region, page, &mut counts)? {
-                        return Ok(counts.shared);
-                    }
-                    run = Run {
-                        start: page,
-                        keep,
-                        shared: false,
-                        zero: false,
-                    };
-                }
                 // A shared page holding only zeros (the zero page a read
-                // maps) holds no data and can stay; one holding data, or a
-                // page in swap, must go.
-                run.shared |= !own && (entry & PM_SWAPPED != 0 || present && !zero);
-                run.zero |= present && zero;
+                // maps) holds no data; one holding data, or a page in
+                // swap, must go.
+                let shared = !own && (entry & PM_SWAPPED != 0 || present && !zero);
+                if walk.page(region, page, own && !zero, shared, present && zero)? {
+                    return Ok(walk.drops.shared);
+                }
             }
             chunk += n;
         }
-        run.end(region, region.pages, &mut counts)?;
-        Ok(counts.shared)
+        walk.finish(region)
+    }
+
+    /// [`scan`](Self::scan) from `PAGEMAP_SCAN`'s ranges of present or
+    /// swapped pages; what lies between them is empty. `None` when the
+    /// first call fails, before anything is reset, for the caller to read
+    /// entries instead. A later call failing is an error, as the region is
+    /// partly reset. Either way, later scans read entries.
+    fn scan_ranges(&mut self, region: &mut Region<'_>) -> std::io::Result<Option<usize>> {
+        use std::os::fd::AsRawFd;
+        let size = page_size::get();
+        let base = region.addr(0) as u64;
+        let fd = self.pagemap()?.file.as_raw_fd();
+        let mut ranges = [PageRegion::default(); SCAN_RANGES];
+        let mut arg = PmScanArg::new(base, base + (region.pages * size) as u64, &mut ranges);
+        let mut walk = Walk::default();
+        let mut next = 0;
+        loop {
+            let n = match pagemap_scan(fd, &mut arg) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    // Before Linux 6.7 there is no such ioctl; anything else
+                    // is unexpected.
+                    if e.raw_os_error() == Some(libc::ENOTTY) {
+                        debug!("no PAGEMAP_SCAN, reading pagemap one entry a page");
+                    } else {
+                        warn!("PAGEMAP_SCAN failed, reading pagemap one entry a page: {e}");
+                    }
+                    NO_RANGES.store(true, Ordering::Relaxed);
+                    // Past the first call, part of the region is reset: the
+                    // caller drops it all.
+                    return if arg.start == base { Ok(None) } else { Err(e) };
+                }
+            };
+            for range in ranges.iter().take(n) {
+                let first = (range.start - base) as usize / size;
+                let end = (range.end - base) as usize / size;
+                if first > next && walk.page(region, next, false, false, false)? {
+                    return Ok(Some(walk.drops.shared));
+                }
+                let swapped = range.categories & PAGE_IS_SWAPPED != 0;
+                let zero_page = range.categories & PAGE_IS_PFNZERO != 0;
+                for page in first..end {
+                    let zero = !swapped && (zero_page || region.is_zero(page));
+                    if walk.page(region, page, !swapped && !zero, swapped, zero)? {
+                        return Ok(Some(walk.drops.shared));
+                    }
+                }
+                next = end;
+            }
+            if arg.walk_end >= arg.end {
+                break;
+            }
+            arg.start = arg.walk_end;
+        }
+        if next < region.pages && walk.page(region, next, false, false, false)? {
+            return Ok(Some(walk.drops.shared));
+        }
+        walk.finish(region).map(Some)
+    }
+}
+
+/// Run `PAGEMAP_SCAN` on pagemap `fd`. Returns the ranges it filled.
+fn pagemap_scan(fd: std::os::fd::RawFd, arg: &mut PmScanArg) -> std::io::Result<usize> {
+    // SAFETY: `arg` describes its `vec`, which the kernel fills with at
+    // most `vec_len` entries.
+    let n = unsafe { libc::ioctl(fd, PAGEMAP_SCAN, &mut *arg) };
+    usize::try_from(n).map_err(|_| std::io::Error::last_os_error())
+}
+
+/// `PAGEMAP_SCAN`: `_IOWR('f', 16, struct pm_scan_arg)`. The request is
+/// a `c_ulong` on glibc and a `c_int` on musl.
+const PAGEMAP_SCAN: libc::Ioctl = 0xC060_6610u32 as libc::Ioctl;
+const PAGE_IS_PRESENT: u64 = 1 << 3;
+const PAGE_IS_SWAPPED: u64 = 1 << 4;
+const PAGE_IS_PFNZERO: u64 = 1 << 5;
+
+/// `struct pm_scan_arg`.
+#[repr(C)]
+#[derive(Default)]
+struct PmScanArg {
+    size: u64,
+    flags: u64,
+    start: u64,
+    end: u64,
+    walk_end: u64,
+    vec: u64,
+    vec_len: u64,
+    max_pages: u64,
+    category_inverted: u64,
+    category_mask: u64,
+    category_anyof_mask: u64,
+    return_mask: u64,
+}
+
+impl PmScanArg {
+    /// Report into `ranges` the present or swapped pages in
+    /// `[start, end)`, flagging those mapped to the zero page.
+    fn new(start: u64, end: u64, ranges: &mut [PageRegion]) -> Self {
+        Self {
+            size: size_of::<Self>() as u64,
+            start,
+            end,
+            vec: ranges.as_mut_ptr() as u64,
+            vec_len: ranges.len() as u64,
+            category_anyof_mask: PAGE_IS_PRESENT | PAGE_IS_SWAPPED,
+            return_mask: PAGE_IS_PRESENT | PAGE_IS_SWAPPED | PAGE_IS_PFNZERO,
+            ..Self::default()
+        }
+    }
+}
+
+/// `struct page_region`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PageRegion {
+    start: u64,
+    end: u64,
+    categories: u64,
+}
+
+/// The runs a scan makes from pages fed in order.
+struct Walk {
+    run: Run,
+    drops: Drops,
+}
+
+impl Default for Walk {
+    fn default() -> Self {
+        Self {
+            run: Run {
+                start: 0,
+                keep: false,
+                shared: false,
+                zero: false,
+            },
+            drops: Drops::default(),
+        }
+    }
+}
+
+impl Walk {
+    /// Page `page` is kept, or not and holds shared or swapped data, or
+    /// zeros. Every page up to the next one fed is as this one. True once
+    /// shared drops pass [`MAX_DROPS`].
+    fn page(
+        &mut self,
+        region: &mut Region<'_>,
+        page: usize,
+        keep: bool,
+        shared: bool,
+        zero: bool,
+    ) -> std::io::Result<bool> {
+        if keep != self.run.keep {
+            if self.run.end(region, page, &mut self.drops)? {
+                return Ok(true);
+            }
+            self.run = Run {
+                start: page,
+                keep,
+                shared: false,
+                zero: false,
+            };
+        }
+        self.run.shared |= shared;
+        self.run.zero |= zero;
+        Ok(false)
+    }
+
+    /// End the last run at the end of the region.
+    fn finish(mut self, region: &mut Region<'_>) -> std::io::Result<usize> {
+        self.run.end(region, region.pages, &mut self.drops)?;
+        Ok(self.drops.shared)
     }
 }
 
@@ -351,24 +544,115 @@ mod tests {
     /// usual pages, others far away, and nothing at all.
     #[test]
     fn every_reset_leaves_the_region_zero() {
-        let mut mem = region(2048);
-        let mut state = ScratchReset::default();
-        for round in 0..100usize {
-            match round % 7 {
-                3 => {}
-                5 => {
-                    write(&mut mem, 1500 + round % 300, 0xa5);
-                    write(&mut mem, 40 + round % 8, 0x5a);
-                }
-                _ => {
-                    for p in 32..96 {
-                        write(&mut mem, p, round as u8 | 1);
+        for mut state in states() {
+            let mut mem = region(2048);
+            for round in 0..100usize {
+                match round % 7 {
+                    3 => {}
+                    5 => {
+                        write(&mut mem, 1500 + round % 300, 0xa5);
+                        write(&mut mem, 40 + round % 8, 0x5a);
+                    }
+                    _ => {
+                        for p in 32..96 {
+                            write(&mut mem, p, round as u8 | 1);
+                        }
                     }
                 }
+                reset(&mut state, &mut mem);
+                assert!(all_zero(&mut mem), "round {round}");
             }
-            reset(&mut state, &mut mem);
-            assert!(all_zero(&mut mem), "round {round}");
         }
+    }
+
+    /// A reset reading `PAGEMAP_SCAN` ranges, and one reading entries a
+    /// page.
+    fn states() -> [ScratchReset; 2] {
+        [
+            ScratchReset::default(),
+            ScratchReset {
+                no_ranges: true,
+                ..ScratchReset::default()
+            },
+        ]
+    }
+
+    /// Both ways of reading pagemap leave every page alike.
+    #[test]
+    fn ranges_and_entries_agree() {
+        let pages = 4096;
+        let run = |state: &mut ScratchReset| {
+            let mut mem = region(pages);
+            for p in 0..1000 {
+                write(&mut mem, p, 1);
+            }
+            reset(state, &mut mem);
+            for p in (0..100).step_by(3) {
+                write(&mut mem, p, 1);
+            }
+            for p in 2000..2100 {
+                assert_eq!(mem.as_mut_slice()[p * page()], 0);
+            }
+            write(&mut mem, pages - 1, 1);
+            reset(state, &mut mem);
+            assert!(all_zero(&mut mem));
+            (0..pages)
+                .map(|p| {
+                    let e = entry(&mem, p);
+                    (kept(e), held(e))
+                })
+                .collect::<Vec<_>>()
+        };
+        let [mut ranges, mut entries] = states();
+        assert_eq!(run(&mut ranges), run(&mut entries));
+    }
+
+    /// From Linux 6.7, resets read ranges, not entries a page: the ioctl
+    /// is only missing (ENOTTY) before that, and any other failure is a
+    /// wrong call.
+    #[test]
+    fn ranges_are_read_where_supported() {
+        use std::os::fd::AsRawFd;
+        let mut mem = region(64);
+        write(&mut mem, 3, 1);
+        let file = File::open("/proc/self/pagemap").unwrap();
+        let mut ranges = [PageRegion::default(); 4];
+        let base = mem.base_ptr() as u64;
+        let mut arg = PmScanArg::new(base, base + 64 * page() as u64, &mut ranges);
+        match pagemap_scan(file.as_raw_fd(), &mut arg) {
+            Err(e) if e.raw_os_error() == Some(libc::ENOTTY) => {
+                eprintln!("no PAGEMAP_SCAN: ranges_are_read_where_supported skipped");
+                return;
+            }
+            result => assert_eq!(result.unwrap(), 1),
+        }
+        assert_eq!(ranges[0].start, base + 3 * page() as u64);
+        assert_eq!(ranges[0].categories & PAGE_IS_PRESENT, PAGE_IS_PRESENT);
+        let [mut ranges, mut entries] = states();
+        reset(&mut ranges, &mut mem);
+        assert!(ranges.read_ranges && !NO_RANGES.load(Ordering::Relaxed));
+        reset(&mut entries, &mut mem);
+        assert!(!entries.read_ranges);
+    }
+
+    /// A scan goes on where a call that filled its ranges stopped.
+    #[test]
+    fn a_scan_continues_past_full_ranges() {
+        let pages = SCAN_RANGES * 8;
+        let run = |state: &mut ScratchReset| {
+            let mut mem = region(pages);
+            // Every other page, so each is a range of its own.
+            for p in (0..pages).step_by(2) {
+                write(&mut mem, p, 1);
+            }
+            reset(state, &mut mem);
+            assert!(all_zero(&mut mem));
+            (0..pages).map(|p| kept(entry(&mem, p))).collect::<Vec<_>>()
+        };
+        let [mut ranges, mut entries] = states();
+        let kept = run(&mut ranges);
+        assert!(kept.iter().step_by(2).all(|&k| k));
+        assert_eq!(kept, run(&mut entries));
     }
 
     #[test]
@@ -383,32 +667,34 @@ mod tests {
     /// many there are.
     #[test]
     fn written_pages_stay_backed() {
-        let mut mem = region(8192);
-        let mut state = ScratchReset::default();
-        for p in 0..8192 {
-            write(&mut mem, p, 1);
+        for mut state in states() {
+            let mut mem = region(8192);
+            for p in 0..8192 {
+                write(&mut mem, p, 1);
+            }
+            reset(&mut state, &mut mem);
+            assert!((0..8192).all(|p| kept(entry(&mem, p))));
+            assert!(all_zero(&mut mem));
         }
-        reset(&mut state, &mut mem);
-        assert!((0..8192).all(|p| kept(entry(&mem, p))));
-        assert!(all_zero(&mut mem));
     }
 
     /// Pages a run did not write are given back: what stays resident
     /// follows the last run, not the most any run wrote.
     #[test]
     fn pages_not_written_since_are_dropped() {
-        let mut mem = region(2048);
-        let mut state = ScratchReset::default();
-        for p in 0..512 {
-            write(&mut mem, p, 1);
+        for mut state in states() {
+            let mut mem = region(2048);
+            for p in 0..512 {
+                write(&mut mem, p, 1);
+            }
+            reset(&mut state, &mut mem);
+            assert!(kept(entry(&mem, 300)));
+            write(&mut mem, 0, 1);
+            reset(&mut state, &mut mem);
+            assert!(kept(entry(&mem, 0)));
+            assert!(!held(entry(&mem, 300)));
+            assert!(all_zero(&mut mem));
         }
-        reset(&mut state, &mut mem);
-        assert!(kept(entry(&mem, 300)));
-        write(&mut mem, 0, 1);
-        reset(&mut state, &mut mem);
-        assert!(kept(entry(&mem, 0)));
-        assert!(!held(entry(&mem, 300)));
-        assert!(all_zero(&mut mem));
     }
 
     /// Sparse writes across an earlier, larger footprint leave many runs
@@ -416,68 +702,71 @@ mod tests {
     /// left, but never make the reset drop everything.
     #[test]
     fn sparse_writes_keep_their_pages() {
-        let mut mem = region(4096);
-        let mut state = ScratchReset::default();
-        for p in 0..4096 {
-            write(&mut mem, p, 1);
+        for mut state in states() {
+            let mut mem = region(4096);
+            for p in 0..4096 {
+                write(&mut mem, p, 1);
+            }
+            reset(&mut state, &mut mem);
+            for p in (0..4096).step_by(16) {
+                write(&mut mem, p, 1);
+            }
+            reset(&mut state, &mut mem);
+            assert!((0..4096).step_by(16).all(|p| kept(entry(&mem, p))));
+            assert!(all_zero(&mut mem));
         }
-        reset(&mut state, &mut mem);
-        for p in (0..4096).step_by(16) {
-            write(&mut mem, p, 1);
-        }
-        reset(&mut state, &mut mem);
-        assert!((0..4096).step_by(16).all(|p| kept(entry(&mem, p))));
-        assert!(all_zero(&mut mem));
     }
 
     /// The zero page a read maps holds no data: it is dropped like an
     /// unwritten page, never as a run that must go.
     #[test]
     fn zero_page_reads_are_dropped_as_unwritten() {
-        let mut mem = region(512);
-        let mut state = ScratchReset::default();
-        write(&mut mem, 10, 1);
-        write(&mut mem, 200, 1);
-        reset(&mut state, &mut mem);
-        for p in (11..200).step_by(2) {
-            assert_eq!(mem.as_mut_slice()[p * page()], 0);
+        for mut state in states() {
+            let mut mem = region(512);
+            write(&mut mem, 10, 1);
+            write(&mut mem, 200, 1);
+            reset(&mut state, &mut mem);
+            for p in (11..200).step_by(2) {
+                assert_eq!(mem.as_mut_slice()[p * page()], 0);
+            }
+            write(&mut mem, 10, 1);
+            write(&mut mem, 200, 1);
+            assert_eq!(
+                state
+                    .scan(&mut Region {
+                        pages: 512,
+                        mem: &mut mem
+                    })
+                    .unwrap(),
+                0
+            );
+            assert!(!held(entry(&mem, 11)));
+            assert!(kept(entry(&mem, 10)) && kept(entry(&mem, 200)));
+            assert!(all_zero(&mut mem));
         }
-        write(&mut mem, 10, 1);
-        write(&mut mem, 200, 1);
-        assert_eq!(
-            state
-                .scan(&mut Region {
-                    pages: 512,
-                    mem: &mut mem
-                })
-                .unwrap(),
-            0
-        );
-        assert!(!held(entry(&mem, 11)));
-        assert!(kept(entry(&mem, 10)) && kept(entry(&mem, 200)));
-        assert!(all_zero(&mut mem));
     }
 
     /// A run not kept is one drop however many pagemap chunks it spans:
     /// more separate drops than [`MAX_DROPS`] would leave some of it.
     #[test]
     fn a_run_across_chunks_is_one_drop() {
-        let chunks = MAX_DROPS + 4;
-        let pages = CHUNK_PAGES * chunks;
-        let mut mem = region(pages);
-        let mut state = ScratchReset::default();
-        for c in 0..chunks {
-            write(&mut mem, c * CHUNK_PAGES + 7, 1);
+        for mut state in states() {
+            let chunks = MAX_DROPS + 4;
+            let pages = CHUNK_PAGES * chunks;
+            let mut mem = region(pages);
+            for c in 0..chunks {
+                write(&mut mem, c * CHUNK_PAGES + 7, 1);
+            }
+            write(&mut mem, 0, 1);
+            write(&mut mem, pages - 1, 1);
+            reset(&mut state, &mut mem);
+            // Only the ends written again: what lies between is left zero.
+            write(&mut mem, 0, 1);
+            write(&mut mem, pages - 1, 1);
+            reset(&mut state, &mut mem);
+            assert!((0..chunks).all(|c| !held(entry(&mem, c * CHUNK_PAGES + 7))));
+            assert!(kept(entry(&mem, 0)) && kept(entry(&mem, pages - 1)));
         }
-        write(&mut mem, 0, 1);
-        write(&mut mem, pages - 1, 1);
-        reset(&mut state, &mut mem);
-        // Only the ends written again: what lies between is left zero.
-        write(&mut mem, 0, 1);
-        write(&mut mem, pages - 1, 1);
-        reset(&mut state, &mut mem);
-        assert!((0..chunks).all(|c| !held(entry(&mem, c * CHUNK_PAGES + 7))));
-        assert!(kept(entry(&mem, 0)) && kept(entry(&mem, pages - 1)));
     }
 
     /// Runs that must go always drop, and past [`MAX_DROPS`] of them the
@@ -511,41 +800,51 @@ mod tests {
     /// A page in swap holds the guest's data. The reset drops it.
     #[test]
     fn a_swapped_page_is_dropped() {
-        let mut mem = region(512);
-        let mut state = ScratchReset::default();
-        write(&mut mem, 10, 0x77);
-        // SAFETY: the test's own mapping.
-        unsafe {
-            libc::madvise(
-                mem.base_ptr().add(10 * page()) as *mut libc::c_void,
-                page(),
-                libc::MADV_PAGEOUT,
-            )
-        };
-        if entry(&mem, 10) & PM_SWAPPED == 0 {
-            eprintln!("no swap: a_swapped_page_is_dropped skipped");
-            return;
+        for mut state in states() {
+            let mut mem = region(512);
+            write(&mut mem, 10, 0x77);
+            // SAFETY: the test's own mapping.
+            unsafe {
+                libc::madvise(
+                    mem.base_ptr().add(10 * page()) as *mut libc::c_void,
+                    page(),
+                    libc::MADV_PAGEOUT,
+                )
+            };
+            if entry(&mem, 10) & PM_SWAPPED == 0 {
+                eprintln!("no swap: a_swapped_page_is_dropped skipped");
+                return;
+            }
+            reset(&mut state, &mut mem);
+            assert!(all_zero(&mut mem));
         }
-        reset(&mut state, &mut mem);
-        assert!(all_zero(&mut mem));
     }
 
     /// A forked child resets its own pages, not the ones its parent's
     /// pagemap shows. After the fork the parent writes pages 10 and 20
     /// again, so its pagemap shows them as its own and page 15, which the
     /// child wrote, as empty: a reset reading it would leave page 15.
+    /// Page 40 holds data shared with the child at the fork, which the
+    /// child's reset must not leave; the child keeps page 39 so page 40
+    /// is not in a run dropped anyway.
     /// Ignored: it forks, so `forked_child_shim` runs it alone in a
     /// process of its own, away from the pages and locks of tests running
     /// in parallel.
     #[test]
     #[ignore]
     fn a_forked_child_resets_its_own_pages() {
+        for state in states() {
+            forked_child_resets(state);
+        }
+    }
+
+    fn forked_child_resets(mut state: ScratchReset) {
         let mut mem = region(512);
-        let mut state = ScratchReset::default();
         write(&mut mem, 10, 1);
         write(&mut mem, 20, 1);
         reset(&mut state, &mut mem);
         assert!(state.pagemap.is_some());
+        write(&mut mem, 40, 0x33);
         let mut fds = [0; 2];
         // SAFETY: two valid fds for the pipe.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -561,6 +860,7 @@ mod tests {
             unsafe { libc::read(fds[0], (&mut byte as *mut u8).cast(), 1) };
             let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 write(&mut mem, 15, 0x5a);
+                write(&mut mem, 39, 0x5a);
                 state.reset(&mut mem).is_ok() && all_zero(&mut mem)
             }));
             // SAFETY: ends the child.
@@ -617,26 +917,27 @@ mod tests {
     /// drop them one by one are dropped all at once.
     #[test]
     fn scattered_swapped_pages_are_dropped_wholesale() {
-        let mut mem = region(2048);
-        let mut state = ScratchReset::default();
-        for p in (0..400).step_by(2) {
-            write(&mut mem, p, 1);
-            write(&mut mem, p + 1, 2);
-            // SAFETY: the test's own mapping.
-            unsafe {
-                libc::madvise(
-                    mem.base_ptr().add((p + 1) * page()) as *mut libc::c_void,
-                    page(),
-                    libc::MADV_PAGEOUT,
-                )
-            };
+        for mut state in states() {
+            let mut mem = region(2048);
+            for p in (0..400).step_by(2) {
+                write(&mut mem, p, 1);
+                write(&mut mem, p + 1, 2);
+                // SAFETY: the test's own mapping.
+                unsafe {
+                    libc::madvise(
+                        mem.base_ptr().add((p + 1) * page()) as *mut libc::c_void,
+                        page(),
+                        libc::MADV_PAGEOUT,
+                    )
+                };
+            }
+            if entry(&mem, 1) & PM_SWAPPED == 0 {
+                eprintln!("no swap: scattered_swapped_pages_are_dropped_wholesale skipped");
+                return;
+            }
+            reset(&mut state, &mut mem);
+            assert!(!kept(entry(&mem, 0)));
+            assert!(all_zero(&mut mem));
         }
-        if entry(&mem, 1) & PM_SWAPPED == 0 {
-            eprintln!("no swap: scattered_swapped_pages_are_dropped_wholesale skipped");
-            return;
-        }
-        reset(&mut state, &mut mem);
-        assert!(!kept(entry(&mem, 0)));
-        assert!(all_zero(&mut mem));
     }
 }
